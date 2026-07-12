@@ -1,0 +1,22 @@
+[Unit]
+Description=Video Compression Manager (Web UI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kxrdyf
+WorkingDirectory=/volume1/scripts/video-manager
+ExecStart=/usr/bin/python3 /volume1/scripts/video-manager/app.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/volume1/scripts/video-manager/logs/stdout.log
+StandardError=append:/volume1/scripts/video-manager/logs/stderr.log
+
+# 安全加固(适度)
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

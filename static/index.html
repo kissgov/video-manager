@@ -1,0 +1,437 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>视频压缩任务管理</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body class="bg-slate-100 text-slate-800 min-h-screen">
+<div id="app" class="max-w-7xl mx-auto p-4 lg:p-6">
+  <!-- Header -->
+  <header class="flex items-center justify-between mb-6">
+    <div>
+      <h1 class="text-2xl font-bold">📹 视频压缩任务管理</h1>
+      <p class="text-sm text-slate-500 mt-1">
+        <span id="sys-ffmpeg" class="font-mono text-xs"></span>
+      </p>
+    </div>
+    <div class="flex items-center gap-3">
+      <span id="status-pill" class="px-3 py-1.5 rounded-full text-sm font-medium bg-slate-200">加载中…</span>
+      <button onclick="refreshStatus()" class="text-slate-500 hover:text-slate-700" title="刷新">↻</button>
+    </div>
+  </header>
+
+  <!-- Tabs -->
+  <nav class="flex gap-1 mb-4 border-b border-slate-200 overflow-x-auto">
+    <button data-tab="overview" class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent hover:text-blue-600 whitespace-nowrap">概览</button>
+    <button data-tab="run"      class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent hover:text-blue-600 whitespace-nowrap">任务</button>
+    <button data-tab="logs"     class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent hover:text-blue-600 whitespace-nowrap">日志</button>
+    <button data-tab="files"    class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent hover:text-blue-600 whitespace-nowrap">文件</button>
+    <button data-tab="config"   class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent hover:text-blue-600 whitespace-nowrap">配置</button>
+    <button data-tab="cron"     class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent hover:text-blue-600 whitespace-nowrap">定时</button>
+    <button data-tab="system"   class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent hover:text-blue-600 whitespace-nowrap">系统</button>
+    <button data-tab="queue"    class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent hover:text-blue-600 whitespace-nowrap">队列</button>
+  </nav>
+
+  <!-- Overview -->
+  <section data-panel="overview" class="space-y-4">
+    <!-- 顶部状态卡 -->
+    <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+        <div class="text-xs text-slate-500 mb-1">当前状态</div>
+        <div id="ov-state" class="text-2xl font-bold">—</div>
+        <div id="ov-pid" class="text-xs text-slate-400 mt-1"></div>
+      </div>
+      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+        <div class="text-xs text-slate-500 mb-1">正在处理</div>
+        <div id="ov-current" class="text-sm font-mono break-all">—</div>
+        <div id="ov-started" class="text-xs text-slate-400 mt-1"></div>
+      </div>
+      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+        <div class="text-xs text-slate-500 mb-1">今日任务 / 文件</div>
+        <div class="flex items-baseline gap-2">
+          <span id="ov-today-runs"   class="text-2xl font-bold">0</span>
+          <span class="text-xs text-slate-400">次</span>
+          <span id="ov-today-files"  class="text-2xl font-bold text-blue-600 ml-2">0</span>
+          <span class="text-xs text-slate-400">文件</span>
+        </div>
+        <div id="ov-today-detail" class="text-xs text-slate-500 mt-1"></div>
+      </div>
+      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+        <div class="text-xs text-slate-500 mb-1">累计</div>
+        <div class="flex items-baseline gap-2">
+          <span id="ov-total-files" class="text-2xl font-bold">0</span>
+          <span class="text-xs text-slate-400">文件</span>
+        </div>
+        <div id="ov-total-detail" class="text-xs text-slate-500 mt-1"></div>
+      </div>
+    </div>
+
+    <!-- 进度 + 队列概览 -->
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+        <div class="flex items-center justify-between mb-2">
+          <h3 class="font-semibold">当前任务进度</h3>
+          <button onclick="showTab('queue')" class="text-xs text-blue-600 hover:underline">查看队列 →</button>
+        </div>
+        <div class="text-xs text-slate-500 mb-2">
+          <span id="ov-progress-label">—</span>
+        </div>
+        <div class="w-full bg-slate-200 rounded-full h-3 overflow-hidden">
+          <div id="ov-progress-bar" class="bg-blue-600 h-full transition-all duration-500" style="width: 0%"></div>
+        </div>
+        <div id="ov-progress-detail" class="text-xs text-slate-500 mt-2">—</div>
+      </div>
+      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+        <div class="flex items-center justify-between mb-2">
+          <h3 class="font-semibold">队列概览</h3>
+          <button onclick="showTab('queue')" class="text-xs text-blue-600 hover:underline">查看详情 →</button>
+        </div>
+        <div id="ov-queue-bars" class="space-y-2 text-xs"></div>
+        <div id="ov-queue-summary" class="text-xs text-slate-500 mt-3">—</div>
+      </div>
+    </div>
+
+    <!-- 磁盘 + 最近失败 -->
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+        <div class="flex items-center justify-between mb-2">
+          <h3 class="font-semibold">磁盘用量</h3>
+          <button onclick="showTab('files')" class="text-xs text-blue-600 hover:underline">浏览文件 →</button>
+        </div>
+        <div id="ov-disk" class="space-y-3 text-xs">—</div>
+      </div>
+      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+        <div class="flex items-center justify-between mb-2">
+          <h3 class="font-semibold">最近失败</h3>
+          <button onclick="showTab('queue'); document.querySelector('[data-qfilter=\"failed\"]').click()" class="text-xs text-blue-600 hover:underline">查看全部 →</button>
+        </div>
+        <div id="ov-failed" class="space-y-1 text-xs">—</div>
+      </div>
+    </div>
+
+    <!-- 最近任务历史 -->
+    <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-semibold">最近任务</h3>
+        <button onclick="loadOverview()" class="text-xs text-blue-600 hover:underline">刷新</button>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead class="text-xs text-slate-500 border-b">
+            <tr>
+              <th class="text-left py-2 px-2">#</th>
+              <th class="text-left py-2 px-2">开始</th>
+              <th class="text-left py-2 px-2">结束</th>
+              <th class="text-left py-2 px-2">触发</th>
+              <th class="text-right py-2 px-2">成功</th>
+              <th class="text-right py-2 px-2">跳过</th>
+              <th class="text-right py-2 px-2">失败</th>
+              <th class="text-right py-2 px-2">总数</th>
+              <th class="text-right py-2 px-2">耗时</th>
+            </tr>
+          </thead>
+          <tbody id="ov-history-body">
+            <tr><td colspan="9" class="text-center py-6 text-slate-400">暂无数据</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- Run -->
+  <section data-panel="run" class="hidden space-y-4">
+    <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-200">
+      <h3 class="font-semibold mb-4">手动运行</h3>
+      <div class="flex items-center gap-3 flex-wrap">
+        <button id="btn-run"  onclick="runTask()" class="px-5 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium disabled:opacity-50 disabled:cursor-not-allowed">▶ 开始压缩</button>
+        <button id="btn-stop" onclick="stopTask()" class="px-5 py-2.5 rounded-lg bg-red-600 hover:bg-red-700 text-white font-medium disabled:opacity-50 disabled:cursor-not-allowed">■ 停止</button>
+        <span id="run-hint" class="text-sm text-slate-500"></span>
+      </div>
+      <div class="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+        <div class="bg-slate-50 rounded-lg p-3">
+          <div class="text-xs text-slate-500">PID</div>
+          <div id="run-pid" class="font-mono">—</div>
+        </div>
+        <div class="bg-slate-50 rounded-lg p-3">
+          <div class="text-xs text-slate-500">启动时间</div>
+          <div id="run-started" class="font-mono">—</div>
+        </div>
+        <div class="bg-slate-50 rounded-lg p-3 md:col-span-2">
+          <div class="text-xs text-slate-500">当前文件</div>
+          <div id="run-current" class="font-mono text-sm break-all">—</div>
+        </div>
+      </div>
+    </div>
+    <div class="bg-amber-50 border border-amber-200 rounded-xl p-4 text-sm text-amber-800">
+      ⚠️ 提示：脚本使用 <code class="bg-amber-100 px-1 rounded">flock</code> 互斥锁,如已有任务在跑,本次点击会被脚本自动跳过。压缩过程中会删除原始监控录像文件(只在输出大于 1MB 时)。
+    </div>
+  </section>
+
+  <!-- Logs -->
+  <section data-panel="logs" class="hidden space-y-4">
+    <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+      <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+        <h3 class="font-semibold">实时日志</h3>
+        <div class="flex items-center gap-2 flex-wrap">
+          <input id="log-search" type="text" placeholder="搜索关键字..."
+                 class="px-2 py-1 text-xs rounded border border-slate-300 w-40 focus:outline-none focus:border-blue-500" />
+          <select id="log-level" class="text-xs px-2 py-1 rounded border border-slate-300">
+            <option value="all">全部</option>
+            <option value="info">信息</option>
+            <option value="ok">成功</option>
+            <option value="warn">警告</option>
+            <option value="error">错误</option>
+          </select>
+          <label class="text-xs text-slate-500 flex items-center gap-1">
+            <input type="checkbox" id="log-autorefresh" checked> 自动刷新
+          </label>
+          <label class="text-xs text-slate-500 flex items-center gap-1">
+            <input type="checkbox" id="log-autoscroll" checked> 自动滚到底
+          </label>
+          <button onclick="loadLogs(true)" class="text-xs px-2 py-1 rounded bg-slate-100 hover:bg-slate-200">手动刷新</button>
+          <button onclick="scrollLogToBottom()" class="text-xs px-2 py-1 rounded bg-slate-100 hover:bg-slate-200">跳到最新</button>
+          <button onclick="clearLogView()" class="text-xs px-2 py-1 rounded bg-slate-100 hover:bg-slate-200">清屏</button>
+          <a href="/api/logs/download" download class="text-xs px-2 py-1 rounded bg-slate-100 hover:bg-slate-200 no-underline text-slate-700">下载</a>
+        </div>
+      </div>
+      <pre id="log-view" class="bg-slate-900 text-slate-100 text-xs font-mono rounded-lg p-3 h-[600px] overflow-auto whitespace-pre-wrap"></pre>
+      <div class="text-xs text-slate-400 mt-1 flex items-center gap-4 flex-wrap" id="log-meta">—</div>
+    </div>
+  </section>
+
+  <!-- Files -->
+  <section data-panel="files" class="hidden space-y-4">
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="font-semibold">📥 输入目录</h3>
+          <button onclick="loadFiles('input')" class="text-xs text-blue-600 hover:underline">刷新</button>
+        </div>
+        <div id="files-input-meta" class="text-xs text-slate-500 mb-2"></div>
+        <div class="overflow-x-auto max-h-[500px]">
+          <table class="w-full text-xs">
+            <thead class="text-slate-500 sticky top-0 bg-white border-b">
+              <tr>
+                <th class="text-left py-2 px-2">路径</th>
+                <th class="text-right py-2 px-2">大小</th>
+                <th class="text-right py-2 px-2">修改时间</th>
+              </tr>
+            </thead>
+            <tbody id="files-input-body"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="font-semibold">📤 输出目录</h3>
+          <button onclick="loadFiles('output')" class="text-xs text-blue-600 hover:underline">刷新</button>
+        </div>
+        <div id="files-output-meta" class="text-xs text-slate-500 mb-2"></div>
+        <div class="overflow-x-auto max-h-[500px]">
+          <table class="w-full text-xs">
+            <thead class="text-slate-500 sticky top-0 bg-white border-b">
+              <tr>
+                <th class="text-left py-2 px-2">路径</th>
+                <th class="text-right py-2 px-2">大小</th>
+                <th class="text-right py-2 px-2">修改时间</th>
+              </tr>
+            </thead>
+            <tbody id="files-output-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Queue -->
+  <section data-panel="queue" class="hidden space-y-4">
+    <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-200">
+      <!-- 统计条 -->
+      <div class="flex flex-wrap items-center gap-4 mb-4">
+        <div class="flex items-center gap-2">
+          <span class="text-xs text-slate-500">待处理</span>
+          <span id="q-stat-pending" class="text-2xl font-bold text-blue-600">—</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <span class="text-xs text-slate-500">处理中</span>
+          <span id="q-stat-running" class="text-2xl font-bold text-amber-500">—</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <span class="text-xs text-slate-500">已完成</span>
+          <span id="q-stat-done" class="text-2xl font-bold text-green-600">—</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <span class="text-xs text-slate-500">跳过</span>
+          <span id="q-stat-skipped" class="text-2xl font-bold text-slate-500">—</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <span class="text-xs text-slate-500">失败</span>
+          <span id="q-stat-failed" class="text-2xl font-bold text-red-600">—</span>
+        </div>
+        <div class="flex-1"></div>
+        <button id="q-btn-rescan"  class="px-3 py-1.5 text-sm rounded-md border border-slate-300 hover:bg-slate-50">重新扫描输入目录</button>
+        <button id="q-btn-retry"   class="px-3 py-1.5 text-sm rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:bg-slate-300" disabled>重试选中</button>
+        <button id="q-btn-delete"  class="px-3 py-1.5 text-sm rounded-md border border-red-300 text-red-700 hover:bg-red-50 disabled:opacity-50" disabled>删除选中</button>
+      </div>
+      <!-- 状态筛选 + 搜索 -->
+      <div class="flex items-center gap-2 mb-3 flex-wrap">
+        <span class="text-xs text-slate-500">筛选:</span>
+        <button data-qfilter="all"      class="q-filter px-2 py-1 text-xs rounded bg-slate-200 text-slate-700">全部</button>
+        <button data-qfilter="pending"  class="q-filter px-2 py-1 text-xs rounded bg-slate-100 text-slate-600">待处理</button>
+        <button data-qfilter="running"  class="q-filter px-2 py-1 text-xs rounded bg-slate-100 text-slate-600">处理中</button>
+        <button data-qfilter="failed"   class="q-filter px-2 py-1 text-xs rounded bg-slate-100 text-slate-600">失败</button>
+        <button data-qfilter="done"     class="q-filter px-2 py-1 text-xs rounded bg-slate-100 text-slate-600">已完成</button>
+        <button data-qfilter="skipped"  class="q-filter px-2 py-1 text-xs rounded bg-slate-100 text-slate-600">跳过</button>
+        <input id="q-search" type="text" placeholder="搜索文件名..."
+               class="ml-auto px-2 py-1 text-xs rounded border border-slate-300 w-48 focus:outline-none focus:border-blue-500" />
+        <span class="text-xs text-slate-500">
+          <span id="q-list-meta">—</span>
+        </span>
+      </div>
+      <!-- 表格 -->
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="border-b border-slate-200 text-left text-xs text-slate-500">
+              <th class="py-1.5 px-2 w-8"><input type="checkbox" id="q-check-all"></th>
+              <th class="py-1.5 px-2 w-16 cursor-pointer select-none hover:text-blue-600" data-sort="id">ID <span class="q-sort-ind"></span></th>
+              <th class="py-1.5 px-2 cursor-pointer select-none hover:text-blue-600" data-sort="rel_path">文件路径 <span class="q-sort-ind"></span></th>
+              <th class="py-1.5 px-2 w-20 text-right cursor-pointer select-none hover:text-blue-600" data-sort="size">输入 <span class="q-sort-ind"></span></th>
+              <th class="py-1.5 px-2 w-20 text-right cursor-pointer select-none hover:text-blue-600" data-sort="output_size">输出 <span class="q-sort-ind"></span></th>
+              <th class="py-1.5 px-2 w-16 text-right cursor-pointer select-none hover:text-blue-600" data-sort="ratio">压缩比 <span class="q-sort-ind"></span></th>
+              <th class="py-1.5 px-2 w-16 text-right cursor-pointer select-none hover:text-blue-600" data-sort="duration_sec">用时 <span class="q-sort-ind"></span></th>
+              <th class="py-1.5 px-2 w-14 text-center cursor-pointer select-none hover:text-blue-600" data-sort="attempts">尝试 <span class="q-sort-ind"></span></th>
+              <th class="py-1.5 px-2 w-20 cursor-pointer select-none hover:text-blue-600" data-sort="status">状态 <span class="q-sort-ind"></span></th>
+              <th class="py-1.5 px-2">最后错误</th>
+              <th class="py-1.5 px-2 w-36 cursor-pointer select-none hover:text-blue-600" data-sort="ended_at">结束时间 <span class="q-sort-ind"></span></th>
+            </tr>
+          </thead>
+          <tbody id="q-body"></tbody>
+        </table>
+      </div>
+      <!-- 分页 -->
+      <div class="flex items-center justify-between mt-3 text-xs text-slate-500">
+        <button id="q-page-prev" class="px-2 py-1 rounded border border-slate-300 hover:bg-slate-50 disabled:opacity-30">上一页</button>
+        <span id="q-page-info">—</span>
+        <button id="q-page-next" class="px-2 py-1 rounded border border-slate-300 hover:bg-slate-50 disabled:opacity-30">下一页</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Config -->
+  <section data-panel="config" class="hidden space-y-4">
+    <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-200">
+      <div class="flex items-center justify-between mb-4">
+        <div>
+          <h3 class="font-semibold">脚本参数</h3>
+          <p class="text-xs text-slate-500 mt-1">修改会写入 <code>/volume1/scripts/compress_video.sh</code>,旧版本自动备份为 <code>.bak.manager</code>。</p>
+        </div>
+        <button onclick="loadConfig()" class="text-xs px-3 py-1.5 rounded bg-slate-100 hover:bg-slate-200">重新读取</button>
+      </div>
+      <form id="config-form" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <!-- fields injected by JS -->
+      </form>
+      <div id="config-restart-warn" class="hidden mt-4 p-3 bg-amber-50 border border-amber-200 rounded-md text-sm text-amber-800">
+        ⚠️ <b>部分项需重启服务才生效。</b> 以 restart 标志为准：输出参数/进程优先级需要重启。
+        重启命令：<code class="bg-amber-100 px-1 rounded">sudo systemctl restart video-manager</code>
+        （如果未配置 systemd，则 kill 当前进程后重新 <code class="bg-amber-100 px-1 rounded">python3 app.py</code>）
+      </div>
+      <div class="mt-4 flex items-center gap-3">
+        <button onclick="saveConfig()" class="px-5 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium">保存</button>
+        <span id="config-msg" class="text-sm"></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- Cron -->
+  <section data-panel="cron" class="hidden space-y-4">
+    <!-- 状态 + 快捷 -->
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+        <div class="text-xs text-slate-500 mb-1">ofelia 容器</div>
+        <div id="cron-ofelia-state" class="text-lg font-semibold">—</div>
+        <div class="text-xs text-slate-400 mt-1">调度任务运行状态</div>
+      </div>
+      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+        <div class="text-xs text-slate-500 mb-1">手动触发</div>
+        <button onclick="triggerRunNow()" class="mt-1 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium">
+          ▶ 立即运行压缩
+        </button>
+        <div class="text-xs text-slate-400 mt-1">直接调起 Python worker 跑</div>
+      </div>
+      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+        <div class="text-xs text-slate-500 mb-1">下次运行</div>
+        <div id="cron-next-runs" class="text-xs space-y-1 mt-1">—</div>
+      </div>
+    </div>
+
+    <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-200">
+      <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <div>
+          <h3 class="font-semibold">定时任务（ofelia）</h3>
+          <p class="text-xs text-slate-500 mt-1">
+            配置文件: <code id="cron-path" class="font-mono">—</code>。保存后会提示重启 ofelia 容器。
+          </p>
+        </div>
+        <div class="flex gap-2">
+          <button onclick="addCronJob()" class="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-sm">+ 新增</button>
+          <button onclick="restartOfelia()" class="px-3 py-1.5 rounded-lg bg-amber-100 hover:bg-amber-200 text-amber-800 text-sm">↻ 重启 ofelia</button>
+        </div>
+      </div>
+      <div id="cron-list" class="space-y-3"></div>
+      <div class="mt-4 flex items-center gap-3">
+        <button onclick="saveCron()" class="px-5 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium">保存</button>
+        <span id="cron-msg" class="text-sm"></span>
+      </div>
+    </div>
+
+    <!-- 运行历史 -->
+    <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-semibold">最近触发记录</h3>
+        <button onclick="loadCron()" class="text-xs text-blue-600 hover:underline">刷新</button>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead class="text-xs text-slate-500 border-b">
+            <tr>
+              <th class="text-left py-2 px-2">#</th>
+              <th class="text-left py-2 px-2">开始</th>
+              <th class="text-left py-2 px-2">结束</th>
+              <th class="text-left py-2 px-2">触发</th>
+              <th class="text-right py-2 px-2">成功</th>
+              <th class="text-right py-2 px-2">失败</th>
+              <th class="text-right py-2 px-2">总数</th>
+              <th class="text-right py-2 px-2">耗时</th>
+            </tr>
+          </thead>
+          <tbody id="cron-history-body">
+            <tr><td colspan="8" class="text-center py-4 text-slate-400">暂无数据</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- System -->
+  <section data-panel="system" class="hidden space-y-4">
+    <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-200">
+      <h3 class="font-semibold mb-3">系统信息</h3>
+      <dl id="sys-info" class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-2 text-sm"></dl>
+    </div>
+    <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-200">
+      <h3 class="font-semibold mb-3">磁盘用量</h3>
+      <div id="disk-info" class="space-y-3"></div>
+    </div>
+  </section>
+
+</div>
+
+<div id="toast" class="fixed bottom-4 right-4 bg-slate-900 text-white text-sm px-4 py-2 rounded-lg shadow-lg opacity-0 transition-opacity pointer-events-none"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

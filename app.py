@@ -1,0 +1,1768 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+compress_video.sh 可视化管理 - 后端
+Python stdlib http.server, zero deps.
+"""
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import threading
+import time
+import signal
+import shlex
+import configparser
+import logging
+from logging.handlers import RotatingFileHandler
+from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+from pathlib import Path
+
+# ============== 配置 ==============
+APP_DIR        = Path("/volume1/scripts/video-manager")
+DATA_DIR       = APP_DIR / "data"
+LOG_DIR        = APP_DIR / "logs"
+STATIC_DIR     = APP_DIR / "static"
+DB_PATH        = DATA_DIR / "history.db"
+APP_LOG_PATH   = LOG_DIR / "app.log"
+
+SCRIPT_PATH    = Path("/volume1/scripts/compress_video.sh")
+SCRIPT_LOG     = Path("/volume1/scripts/compress.log")
+SCRIPT_LOCK    = Path("/volume1/scripts/compress.lock")
+OFELIA_INI     = Path("/volume1/docker/ffmpeg/ofelia.ini")
+OFELIA_BAK     = Path("/volume1/docker/ffmpeg/ofelia.ini.bak")
+INPUT_DIR      = Path("/input")
+OUTPUT_DIR     = Path("/output")
+
+HOST           = "0.0.0.0"
+PORT           = 8765
+
+# ============== 工具 ==============
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# ============== Logging ==============
+# 三路 handler:
+#   1. logs/app.log  — 全量详细(level/timestamp/module/lineno) + size 轮转
+#   2. /volume1/scripts/compress.log — 紧凑 bash 兼容格式(给 UI 读) + size 轮转
+#   3. stdout        — 紧凑格式(nohup 重定向到 logs/stdout.log)
+LOG_LEVEL_FILE     = logging.DEBUG
+LOG_LEVEL_COMPACT  = logging.INFO
+LOG_MAX_BYTES      = 2 * 1024 * 1024   # 2 MiB / 文件
+LOG_BACKUP_APP     = 5
+LOG_BACKUP_COMPACT = 3
+
+_app_handler = RotatingFileHandler(
+    APP_LOG_PATH,
+    maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_APP,
+    encoding="utf-8"
+)
+_app_handler.setLevel(LOG_LEVEL_FILE)
+_app_handler.setFormatter(logging.Formatter(
+    "%(asctime)s [%(levelname)-7s] %(module)s.%(funcName)s:%(lineno)d  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+))
+
+_compress_handler = RotatingFileHandler(
+    SCRIPT_LOG,
+    maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COMPACT,
+    encoding="utf-8"
+)
+_compress_handler.setLevel(LOG_LEVEL_COMPACT)
+_compress_handler.setFormatter(logging.Formatter(
+    "[%(asctime)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+))
+
+_stdout_handler = logging.StreamHandler()
+_stdout_handler.setLevel(LOG_LEVEL_COMPACT)
+_stdout_handler.setFormatter(logging.Formatter(
+    "[%(asctime)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+))
+
+_logger = logging.getLogger("video-manager")
+_logger.setLevel(LOG_LEVEL_FILE)
+_logger.addHandler(_app_handler)
+_logger.addHandler(_compress_handler)
+_logger.addHandler(_stdout_handler)
+_logger.propagate = False
+
+def log(msg, *args, level=logging.INFO):
+    """兼容旧调用;新代码可直接用 _logger.info/.warning/.error/.debug。
+    stacklevel=2 让 %(funcName)s/%(lineno)d 指向真正的 caller 而不是本 wrapper。"""
+    _logger.log(level, msg, *args, stacklevel=2)
+
+def json_response(handler, code, payload):
+    body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+    handler.send_response(code)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    handler.wfile.write(body)
+
+def read_text(path):
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return f"[无法读取 {path}: {e}]"
+
+# ============== 数据库 ==============
+_db_lock = threading.Lock()
+def db():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with db() as conn, _db_lock:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS runs (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at  TEXT NOT NULL,
+            ended_at    TEXT,
+            trigger     TEXT,           -- manual / cron / unknown
+            success     INTEGER DEFAULT 0,
+            skipped     INTEGER DEFAULT 0,
+            failed      INTEGER DEFAULT 0,
+            total       INTEGER DEFAULT 0,
+            note        TEXT
+        );
+        CREATE TABLE IF NOT EXISTS run_files (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id    INTEGER,
+            name      TEXT,
+            ok        INTEGER,         -- 1 成功 0 失败 -1 跳过
+            orig_size TEXT,
+            new_size  TEXT,
+            duration  INTEGER,         -- 秒
+            started_at TEXT,
+            FOREIGN KEY(run_id) REFERENCES runs(id)
+        );
+        CREATE TABLE IF NOT EXISTS tasks (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            rel_path     TEXT NOT NULL UNIQUE,            -- 相对 /input 路径
+            size         INTEGER,
+            status       TEXT NOT NULL DEFAULT 'pending', -- pending|running|done|failed|skipped
+            attempts     INTEGER DEFAULT 0,
+            last_error   TEXT,
+            last_run_id  INTEGER,
+            created_at   TEXT DEFAULT (datetime('now','localtime')),
+            started_at   TEXT,
+            ended_at     TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+        CREATE INDEX IF NOT EXISTS idx_tasks_rel    ON tasks(rel_path);
+        -- 增量迁移:输出大小(只对新任务有值)
+        -- SQLite 不支持 IF NOT EXISTS 列，用 PRAGMA 防御
+        """)
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+        if "output_size" not in cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN output_size INTEGER")
+        # 崩溃恢复:把上轮未结束的 running 重置为 pending
+        conn.execute(
+            "UPDATE tasks SET status='pending', started_at=NULL "
+            "WHERE status='running'"
+        )
+        conn.commit()
+
+# ============== 进程管理 ==============
+_state_lock   = threading.Lock()
+_worker_thread = None              # Thread 对象(取代旧的 _proc = Popen)
+_run_id       = None              # 当前 runs.id
+_current_file = None              # 解析自 log 的 "正在处理" 文件
+_started_at   = None
+
+def proc_alive():
+    global _worker_thread
+    return _worker_thread is not None and _worker_thread.is_alive()
+
+# 检测系统中是否有"看起来像压缩任务"的进程在跑
+# 返回 dict 或 None
+_ext_cache_ts = 0
+_ext_cache    = None
+def detect_external_job():
+    """返回 {pid, script_pid, current_file, started_at} 或 None。"""
+    global _ext_cache, _ext_cache_ts
+    now = time.time()
+    if _ext_cache and now - _ext_cache_ts < 1.5:
+        return _ext_cache
+    try:
+        r = subprocess.run(
+            ["ps", "-eo", "pid,etime,cmd"],
+            capture_output=True, text=True, timeout=3
+        )
+        script_pid = None
+        started_at = None
+        for line in r.stdout.splitlines():
+            if "compress_video.sh" in line and "grep" not in line:
+                # parse etime -> started_at
+                m = re.match(r"\s*(\d+)\s+([\d::-]+)\s+(.*)", line)
+                if m:
+                    pid = int(m.group(1))
+                    etime = m.group(2)
+                    script_pid = pid
+                    started_at = etime_to_start(etime)
+                    break
+        # 找匹配的 ffmpeg 进程(用我们脚本的特征 flag)
+        ffmpeg_pid = None
+        cur_file = None
+        for line in r.stdout.splitlines():
+            if "ffmpeg" in line and ("-vf" in line and ("rkmpp" in line or "vaapi" in line or "libx264" in line or "libx265" in line)):
+                m = re.match(r"\s*(\d+)\s+([\d::-]+)\s+(.*)", line)
+                if m:
+                    ffmpeg_pid = int(m.group(1))
+                    cmd = m.group(3)
+                    mi = re.search(r"-i\s+(\S+)", cmd)
+                    if mi: cur_file = os.path.basename(mi.group(1))
+                    break
+        if script_pid:
+            _ext_cache = {
+                "pid":          ffmpeg_pid or script_pid,
+                "script_pid":   script_pid,
+                "current_file": cur_file,
+                "started_at":   started_at,
+                "external":     True,
+            }
+        else:
+            _ext_cache = None
+        _ext_cache_ts = now
+        return _ext_cache
+    except Exception as e:
+        log(f"detect_external_job 失败: {e}", level=logging.ERROR)
+        return None
+
+def etime_to_start(etime):
+    """ps etime ('HH:MM:SS' 或 'MM:SS' 或 'D-HH:MM:SS') -> 起始时间字符串"""
+    try:
+        days = 0
+        if "-" in etime:
+            d, etime = etime.split("-", 1)
+            days = int(d)
+        parts = etime.split(":")
+        if len(parts) == 3:
+            h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+        elif len(parts) == 2:
+            h, m, s = 0, int(parts[0]), int(parts[1])
+        else:
+            return None
+        delta = timedelta(days=days, hours=h, minutes=m, seconds=s)
+        return (datetime.now() - delta).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+def get_state():
+    with _state_lock:
+        if proc_alive():
+            return {
+                "running":      True,
+                "pid":          os.getpid(),
+                "run_id":       _run_id,
+                "current_file": _current_file,
+                "started_at":   _started_at,
+                "external":     False,
+            }
+    # 没有自己启动的进程,检查外部
+    ext = detect_external_job()
+    if ext:
+        return {
+            "running":      True,
+            "pid":          ext["pid"],
+            "script_pid":   ext["script_pid"],
+            "current_file": ext["current_file"],
+            "started_at":   ext["started_at"],
+            "external":     True,
+            "run_id":       None,
+        }
+    return {
+        "running":      False,
+        "pid":          None,
+        "run_id":       None,
+        "current_file": None,
+        "started_at":   None,
+        "external":     False,
+    }
+
+# 在 log 文件上做"自上次读取以来的增量"跟踪(基于行号),用于实时显示
+_log_pos_lock = threading.Lock()
+_log_pos       = 0
+
+def read_log_tail(limit=200, since=0, level="all", search=None, max_lines=5000):
+    """读日志尾部。
+    since>0: 只返回该行号之后的内容
+    level:   all / error / warn / info / ok
+    search:  关键字过滤(行内包含)
+    max_lines: 服务器端最多返回这么多行(避免一次拉太多)
+    """
+    try:
+        text = SCRIPT_LOG.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return [], 0
+    lines = text.splitlines()
+    total = len(lines)
+
+    def match_level(line: str, lv: str) -> bool:
+        if lv == "all":
+            return True
+        lc = line.lower()
+        if lv == "error":
+            return any(k in line for k in ("失败", "错误", "error", "exit=", "fatal", "Exception"))
+        if lv == "warn":
+            return any(k in line for k in ("警告", "warn", "超时"))
+        if lv == "ok":
+            return any(k in line for k in ("完成", "成功", "已启动", "已停止", "启动:"))
+        if lv == "info":
+            # "info" = 不属于 warn/error/ok 的其他行
+            return not any(k in line for k in
+                ("失败", "错误", "error", "exit=", "fatal", "Exception",
+                 "警告", "warn", "超时",
+                 "完成", "成功", "已启动", "已停止", "启动:"))
+        return True
+
+    def match_search(line: str, q: str) -> bool:
+        if not q:
+            return True
+        return q.lower() in line.lower()
+
+    # 过滤
+    filtered = [
+        (i + 1, ln) for i, ln in enumerate(lines)
+        if match_level(ln, level) and match_search(ln, search or "")
+    ]
+
+    if since > 0:
+        # since 是上次返回的最大行号
+        filtered = [(n, ln) for n, ln in filtered if n > since]
+    else:
+        # 取最后 limit 行
+        filtered = filtered[-limit:]
+
+    # 限制最大返回
+    if len(filtered) > max_lines:
+        filtered = filtered[-max_lines:]
+
+    # 返回 (line_no, text)
+    return [(n, ln) for n, ln in filtered], total
+
+# 解析日志,获取"当前正在处理的文件"(最近一条 [开始] 而其后无 [完成]/[失败]/[跳过])
+_current_file_lock = threading.Lock()
+def update_current_file():
+    """从 log 解析当前正在压缩的文件,写入全局状态。"""
+    global _current_file
+    try:
+        text = SCRIPT_LOG.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return
+    started = None
+    finished_names = set()
+    for line in text.splitlines()[-500:]:  # 只看最近 500 行
+        m = re.search(r"\[开始\] (.+?)（", line)
+        if m:
+            started = m.group(1)
+        m2 = re.search(r"\[完成\] (.+?) \|", line)
+        if m2:
+            finished_names.add(m2.group(1))
+        m3 = re.search(r"\[失败\] (.+?) ", line)
+        if m3:
+            finished_names.add(m3.group(1))
+        m4 = re.search(r"\[跳过\] (.+?)（", line)
+        if m4:
+            finished_names.add(m4.group(1))
+    cur = None
+    if started and started not in finished_names:
+        cur = started
+    with _current_file_lock, _state_lock:
+        _current_file = cur
+
+# ============== Worker (Python 取代 compress_video.sh) ==============
+import fcntl as _fcntl
+
+# 编码参数 (从 compress_video.sh 同步)
+_OUTPUT_HEIGHT  = 720
+_OUTPUT_FPS     = 10
+_OUTPUT_WIDTH   = 1280  # 仅用于日志,实际靠 -vf scale=-2:HEIGHT
+_SOFT_CODEC     = "libx264"
+_SOFT_PRESET    = "veryfast"
+_SOFT_CRF       = 28
+_VAAPI_QP       = 28
+_NICE_LEVEL     = 10
+_MIN_FILE_SIZE  = 1_048_576  # 1MB,小于视为损坏
+_MAX_LOG_LINES  = 2000
+
+_LOCK_FILE      = Path("/scripts/compress.lock")
+_SCRIPT_LOG     = Path("/scripts/compress.log")
+
+_worker_thread  = None      # Thread 对象
+_ffmpeg_proc    = None      # 当前 ffmpeg 子进程(用于 stop)
+_stop_event     = threading.Event()
+
+def _rotate_log():
+    """已废弃:_compress_handler (RotatingFileHandler) 自动按 size 轮转。
+    保留为空函数以兼容 worker 末尾的旧调用点。"""
+    pass
+
+def _resolve_ffmpeg_bin() -> str:
+    for path in [
+        "/usr/local/bin/ffmpeg-rkmpp",
+        "/usr/local/rkmpp/ffmpeg",
+        "/ugreen/@appstore/com.ugreen.transcode/lib/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+    ]:
+        try:
+            p = Path(path)
+            if p.is_file() and os.access(path, os.X_OK):
+                return path
+        except OSError:
+            continue
+    return "/usr/bin/ffmpeg"
+
+def _probe_encoders(ffmpeg_bin: str) -> str:
+    try:
+        r = subprocess.run(
+            [ffmpeg_bin, "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return r.stdout
+    except Exception as e:
+        log(f"枚举编码器失败: {e}", level=logging.ERROR)
+        return ""
+
+def _probe_hwaccel_ok(ffmpeg_bin: str, mode: str) -> bool:
+    """运行一个微编码测试,退出码为 0 表示硬件可用。"""
+    if mode == "rkmpp":
+        cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-nostdin",
+               "-f", "lavfi", "-i", "color=c=black:s=320x240:d=1:r=10",
+               "-c:v", "h264_rkmpp", "-qp", "28", "-rc_mode", "2",
+               "-frames:v", "1", "-f", "null", "-"]
+    elif mode == "vaapi":
+        cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-nostdin",
+               "-init_hw_device", "vaapi=foo:/dev/dri/renderD128",
+               "-f", "lavfi", "-i", "color=c=black:s=320x240:d=1:r=10",
+               "-frames:v", "1", "-f", "null", "-"]
+    else:
+        return False
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=30)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+def _detect_hwaccel() -> str:
+    """镜像 compress_video.sh 的 detect_hwaccel 逻辑。"""
+    ffmpeg_bin = _resolve_ffmpeg_bin()
+    encs = _probe_encoders(ffmpeg_bin)
+
+    # 0. RKMPP
+    if Path("/dev/mpp_service").exists():
+        if "hevc_rkmpp" in encs:
+            if _probe_hwaccel_ok(ffmpeg_bin, "rkmpp"):
+                return "rkmpp"
+            log("MPP 设备在但 h264_rkmpp 探测失败", level=logging.WARNING)
+        else:
+            log("FFMPEG_BIN 缺少 hevc_rkmpp 编码器,可能用错二进制", level=logging.WARNING)
+
+    # 1. 没 GPU 设备就软
+    if not Path("/dev/dri/renderD128").exists() and not Path("/dev/dri/card0").exists():
+        return "soft"
+
+    # 2. VAAPI
+    if "hevc_vaapi" in encs:
+        if _probe_hwaccel_ok(ffmpeg_bin, "vaapi"):
+            return "vaapi"
+        log("VAAPI 设备存在但初始化失败", level=logging.WARNING)
+
+    # 3. V4L2
+    if "hevc_v4l2m2m" in encs:
+        try:
+            r = subprocess.run("ls /dev/video* 2>/dev/null | head -1",
+                               shell=True, capture_output=True, text=True, timeout=3)
+            dev = r.stdout.strip()
+            if dev:
+                pr = subprocess.run(
+                    [ffmpeg_bin, "-hide_banner", "-f", "v4l2",
+                     "-list_formats", "all", "-i", dev],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if "HEVC" in (pr.stdout + pr.stderr):
+                    return "v4l2m2m"
+        except Exception as e:
+            log(f"v4l2 探测异常: {e}", level=logging.WARNING)
+
+    # 4. QSV
+    if "hevc_qsv" in encs:
+        return "qsv"
+
+    return "soft"
+
+def _build_ffmpeg_cmd(input_file: Path, output_file: Path, hwaccel: str, ffmpeg_bin: str) -> list:
+    base = ["nice", "-n", str(_NICE_LEVEL),
+            ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error",
+            "-err_detect", "ignore_err", "-fflags", "+discardcorrupt"]
+    if hwaccel == "rkmpp":
+        return base + [
+            "-i", str(input_file),
+            "-vf", f"scale=-2:{_OUTPUT_HEIGHT},fps={_OUTPUT_FPS}",
+            "-c:v", "h264_rkmpp", "-qp", str(_VAAPI_QP), "-rc_mode", "2",
+            "-an", "-movflags", "+faststart", "-y", str(output_file),
+        ]
+    if hwaccel == "vaapi":
+        return base + [
+            "-hwaccel", "vaapi", "-hwaccel_device", "/dev/dri/renderD128",
+            "-vaapi_device", "/dev/dri/renderD128",
+            "-i", str(input_file),
+            "-vf", f"format=nv12|vaapi,hwupload,scale_vaapi=-2:{_OUTPUT_HEIGHT}:format=nv12,framerate=fps={_OUTPUT_FPS}",
+            "-c:v", "hevc_vaapi", "-qp", str(_VAAPI_QP),
+            "-an", "-movflags", "+faststart", "-y", str(output_file),
+        ]
+    if hwaccel == "v4l2m2m":
+        return base + [
+            "-i", str(input_file),
+            "-vf", f"scale=-2:{_OUTPUT_HEIGHT},fps={_OUTPUT_FPS}",
+            "-c:v", "hevc_v4l2m2m", "-num_capture_buffers", "32",
+            "-b:v", "1M", "-maxrate", "1.5M", "-bufsize", "2M",
+            "-an", "-movflags", "+faststart", "-y", str(output_file),
+        ]
+    if hwaccel == "qsv":
+        return base + [
+            "-hwaccel", "qsv", "-c:v", "h264_qsv",
+            "-i", str(input_file),
+            "-vf", f"scale_qsv=-2:{_OUTPUT_HEIGHT},vpp_qsv=framerate={_OUTPUT_FPS}",
+            "-c:v", "hevc_qsv", "-global_quality", str(_VAAPI_QP), "-preset", "medium",
+            "-an", "-movflags", "+faststart", "-y", str(output_file),
+        ]
+    # soft
+    return base + [
+        "-threads", "0",
+        "-i", str(input_file),
+        "-vf", f"scale=-2:{_OUTPUT_HEIGHT},fps={_OUTPUT_FPS}",
+        "-c:v", _SOFT_CODEC, "-crf", str(_SOFT_CRF), "-preset", _SOFT_PRESET,
+        "-tune", "fastdecode",
+        "-an", "-movflags", "+faststart", "-y", str(output_file),
+    ]
+
+def _run_ffmpeg(input_file: Path, output_file: Path, hwaccel: str) -> tuple:
+    """跑一个文件,返回 (exit_code, stderr_text)。"""
+    ffmpeg_bin = _resolve_ffmpeg_bin()
+    cmd = _build_ffmpeg_cmd(input_file, output_file, hwaccel, ffmpeg_bin)
+    proc = None
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        with _state_lock:
+            _ffmpeg_proc = proc
+        try:
+            _, err = proc.communicate(timeout=4 * 3600)
+            return proc.returncode, (err or b"").decode("utf-8", errors="replace")
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _, err = proc.communicate()
+            return -1, "ffmpeg 单文件超时(>4h)"
+    except Exception as e:
+        return -1, f"ffmpeg 启动失败: {e}"
+    finally:
+        with _state_lock:
+            _ffmpeg_proc = None
+
+def _set_task_status(task_id: int, status: str, **extra):
+    """便捷更新 tasks 表。"""
+    sets = ["status=?"]
+    vals = [status]
+    for k, v in extra.items():
+        if v is None: continue
+        sets.append(f"{k}=?")
+        vals.append(v)
+    vals.append(task_id)
+    with db() as conn, _db_lock:
+        conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id=?", vals)
+        conn.commit()
+
+def _run_loop(run_id: int, trigger: str):
+    """Worker 主循环。跑在独立线程里。"""
+    global _current_file
+    log(f"========================================")
+    log(f"压缩任务启动 (Python worker v1, run_id={run_id}, trigger={trigger})")
+    ffmpeg_bin = _resolve_ffmpeg_bin()
+    hwaccel = _detect_hwaccel()
+    log(f"输入: {INPUT_DIR}  输出: {OUTPUT_DIR}")
+    log(f"ffmpeg: {ffmpeg_bin}  加速: {hwaccel}  分辨率: {_OUTPUT_WIDTH}x{_OUTPUT_HEIGHT}@{_OUTPUT_FPS}fps")
+    log(f"========================================")
+
+    # flock
+    lock_fd = None
+    try:
+        lock_fd = open(_LOCK_FILE, "w")
+        _fcntl.flock(lock_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+    except (IOError, OSError):
+        log("已有压缩任务运行中(flock 被占用),本实例退出")
+        if lock_fd: lock_fd.close()
+        return
+
+    success = skipped = failed = 0
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        # 先把 /input /output 同步进 tasks
+        try:
+            sync_tasks_from_input()
+        except Exception as e:
+            log(f"sync_tasks 失败(继续): {e}")
+
+        # 崩溃恢复:上轮没正常结束的 running 状态 重置为 pending(避免丢文件)
+        try:
+            with db() as conn, _db_lock:
+                cur = conn.execute(
+                    "UPDATE tasks SET status='pending', started_at=NULL "
+                    "WHERE status='running'"
+                )
+                if cur.rowcount:
+                    log(f"重置 {cur.rowcount} 个遗留 running → pending")
+        except Exception as e:
+            log(f"running 重置失败(继续): {e}")
+
+        with db() as conn, _db_lock:
+            pending = conn.execute("""
+                SELECT id, rel_path, size FROM tasks
+                WHERE status='pending' ORDER BY rel_path ASC
+            """).fetchall()
+        log(f"待处理: {len(pending)} 个 (按文件名时间正序)")
+
+        for i, row in enumerate(pending, 1):
+            if _stop_event.is_set():
+                log(f"收到停止信号,提前结束(已处理 {i-1}/{len(pending)})")
+                break
+
+            tid, rel, size = row["id"], row["rel_path"], row["size"]
+            input_file  = INPUT_DIR / rel
+            output_file = OUTPUT_DIR / rel
+
+            _set_task_status(tid, "running",
+                             started_at=now_str(),
+                             attempts=None,  # 用 SQL 自增在下面处理
+                             last_run_id=run_id)
+            # attempts 自增
+            with db() as conn, _db_lock:
+                conn.execute("UPDATE tasks SET attempts = attempts + 1 WHERE id=?", (tid,))
+                conn.commit()
+
+            with _state_lock:
+                _current_file = rel
+
+            # 输出已存在 -> 跳过
+            if output_file.exists():
+                _set_task_status(tid, "skipped", ended_at=now_str())
+                skipped += 1
+                log(f"[{i}/{len(pending)}] 跳过: {rel} (输出已存在)")
+                continue
+
+            # 输入不在 -> 失败
+            if not input_file.exists():
+                _set_task_status(tid, "failed",
+                                 last_error="input file not found",
+                                 ended_at=now_str())
+                failed += 1
+                log(f"[{i}/{len(pending)}] 失败: {rel} (输入不存在)")
+                continue
+
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+            log(f"[{i}/{len(pending)}] 开始: {rel} ({human_size(size)})")
+            start_ts = time.time()
+            exit_code, err = _run_ffmpeg(input_file, output_file, hwaccel)
+            duration = int(time.time() - start_ts)
+
+            if exit_code == 0 and output_file.exists():
+                out_size = output_file.stat().st_size
+                if out_size > _MIN_FILE_SIZE:
+                    # 成功:删输入,标 done + 记输出大小
+                    try:
+                        input_file.unlink()
+                    except OSError as e:
+                        log(f"  警告: 删除输入失败: {e}", level=logging.WARNING)
+                    _set_task_status(tid, "done",
+                                     ended_at=now_str(),
+                                     output_size=out_size)
+                    success += 1
+                    log(f"  完成 -> {human_size(out_size)} ({duration}s)")
+                else:
+                    try: output_file.unlink()
+                    except OSError: pass
+                    _set_task_status(tid, "failed",
+                                     last_error=f"output too small ({out_size}B)",
+                                     ended_at=now_str())
+                    failed += 1
+                    log(f"  失败: 输出过小 {out_size}B")
+            else:
+                try: output_file.unlink()
+                except OSError: pass
+                err_msg = (err or f"exit={exit_code}")[:500]
+                _set_task_status(tid, "failed",
+                                 last_error=err_msg,
+                                 ended_at=now_str())
+                failed += 1
+                log(f"  失败: exit={exit_code} {err_msg[:120]}")
+
+        log(f"任务完成 | 成功:{success} 跳过:{skipped} 失败:{failed} 总:{len(pending)}")
+
+        with db() as conn, _db_lock:
+            conn.execute("""UPDATE runs SET ended_at=?, 
+                success=?, skipped=?, failed=?, total=? WHERE id=?""",
+                (now_str(), success, skipped, failed, len(pending), run_id))
+            conn.commit()
+        _rotate_log()
+    finally:
+        try:
+            _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+            lock_fd.close()
+        except Exception:
+            pass
+        with _state_lock:
+            _current_file = None
+        log(f"worker 退出")
+
+def start_run(trigger="manual"):
+    global _worker_thread, _run_id, _started_at, _current_file, _stop_event
+    if proc_alive():
+        return False, "本服务启动的任务正在运行"
+    ext = detect_external_job()
+    if ext:
+        return False, f"检测到外部已有压缩任务在运行(script_pid={ext['script_pid']}),请先停止或等其完成"
+    invalidate_ext_cache()
+    try:
+        _started_at = now_str()
+        _current_file = None
+        _stop_event.clear()
+        # 先写 runs 表拿 run_id
+        with db() as conn, _db_lock:
+            cur = conn.execute(
+                "INSERT INTO runs(started_at, trigger) VALUES(?, ?)",
+                (_started_at, trigger)
+            )
+            _run_id = cur.lastrowid
+        _worker_thread = threading.Thread(
+            target=_run_loop, args=(_run_id, trigger), daemon=True
+        )
+        _worker_thread.start()
+        log(f"启动任务 thread run_id={_run_id} trigger={trigger}")
+        return True, f"已启动 run_id={_run_id}"
+    except Exception as e:
+        _worker_thread = None
+        return False, f"启动失败: {e}"
+
+def _watch_run(run_id):
+    """适配旧名:不再使用。新逻辑都在 _run_loop 里。"""
+    pass
+
+def invalidate_ext_cache():
+    global _ext_cache, _ext_cache_ts
+    _ext_cache = None
+    _ext_cache_ts = 0
+
+def get_descendants(root_pid):
+    """递归获取 root_pid 的所有子孙进程(含 root_pid 本身)。用于安全杀死进程树。"""
+    try:
+        r = subprocess.run(
+            ["ps", "-eo", "pid,ppid"],
+            capture_output=True, text=True, timeout=3
+        )
+        children = {}
+        for line in r.stdout.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    p = int(parts[0]); pp = int(parts[1])
+                    children.setdefault(pp, []).append(p)
+                except ValueError:
+                    continue
+        result, stack = [], [root_pid]
+        while stack:
+            cur = stack.pop()
+            result.append(cur)
+            stack.extend(children.get(cur, []))
+        return result
+    except Exception:
+        return [root_pid]
+
+def _kill_tree(pids, sig):
+    for p in pids:
+        try:
+            os.kill(p, sig)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            log(f"无权限杀 pid={p}", level=logging.WARNING)
+
+def stop_run():
+    """优先停自己启动的进程;否则停外部检测到的进程树(只杀脚本及其子进程,不碰用户 shell)。"""
+    global _stop_event, _ffmpeg_proc
+    invalidate_ext_cache()
+    if proc_alive():
+        # 告诉 worker 停止(下一个文件之前检查 stop_event)
+        _stop_event.set()
+        # 同时 SIGTERM 当前 ffmpeg 子进程(如果有),2 秒后 SIGKILL
+        proc = None
+        with _state_lock:
+            proc = _ffmpeg_proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.send_signal(signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        log("已发送停止信号")
+        # 等 worker 退出(最多 10s)
+        try:
+            if _worker_thread:
+                _worker_thread.join(timeout=10)
+        except Exception:
+            pass
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.send_signal(signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        with _state_lock:
+            _worker_thread = None
+            _ffmpeg_proc   = None
+        return True, "已发送停止信号,worker 退出"
+    ext = detect_external_job()
+    if ext:
+        # 外部任务:只杀脚本及其子孙,不碰用户终端 session
+        script_pid = ext["script_pid"]
+        pids = get_descendants(script_pid)
+        log(f"外部任务进程树: {pids}")
+        _kill_tree(pids, signal.SIGTERM)
+        time.sleep(2)
+        # SIGKILL 残留
+        survivors = [p for p in pids if _pid_alive(p)]
+        _kill_tree(survivors, signal.SIGKILL)
+        time.sleep(0.5)
+        invalidate_ext_cache()
+        log(f"已停止外部任务 script_pid={script_pid}, 进程 {len(pids)} 个")
+        return True, f"已停止外部任务 (script_pid={script_pid}, 进程 {len(pids)} 个)"
+    return False, "当前没有任务在运行"
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+# ============== 脚本配置管理 ==============
+# 在 compress_video.sh 里,我们只允许改 "配置区" 的几个变量
+CONFIG_KEYS = [
+    "OUTPUT_WIDTH", "OUTPUT_HEIGHT", "OUTPUT_FPS",
+    "SOFT_CODEC", "SOFT_PRESET", "SOFT_CRF",
+    "VAAPI_QP", "NICE_LEVEL", "MAX_LOG_LINES", "MIN_FILE_SIZE",
+]
+_config_lock = threading.Lock()
+_config_cache = {"text": None, "mtime": 0}
+
+def read_script_config():
+    """解析配置区变量。"""
+    with _config_lock:
+        text = SCRIPT_PATH.read_text(encoding="utf-8")
+        result = {}
+        for line in text.splitlines():
+            line_strip = line.strip()
+            for k in CONFIG_KEYS:
+                if line_strip.startswith(k + "="):
+                    raw = line_strip.split("=", 1)[1]
+                    # 去掉行内注释
+                    raw = raw.split("#", 1)[0].strip()
+                    # 去引号
+                    if (raw.startswith('"') and raw.endswith('"')) or \
+                       (raw.startswith("'") and raw.endswith("'")):
+                        raw = raw[1:-1]
+                    result[k] = raw
+                    break
+        return result, text
+
+def update_script_config(updates: dict):
+    """替换脚本里对应的变量赋值,保留其他内容。"""
+    with _config_lock:
+        text = SCRIPT_PATH.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        out = []
+        for line in lines:
+            replaced = False
+            for k, v in updates.items():
+                if k in CONFIG_KEYS and re.match(rf"^\s*{k}\s*=", line):
+                    if isinstance(v, str) and re.search(r"\s", v):
+                        new_line = re.sub(rf"^(\s*){k}\s*=.*$", rf'\1{k}="{v}"', line)
+                    else:
+                        new_line = re.sub(rf"^(\s*){k}\s*=.*$", rf"\1{k}={v}", line)
+                    out.append(new_line)
+                    replaced = True
+                    break
+            if not replaced:
+                out.append(line)
+        new_text = "\n".join(out) + ("\n" if text.endswith("\n") else "")
+        # 备份
+        bak = SCRIPT_PATH.with_suffix(".sh.bak.manager")
+        bak.write_text(text, encoding="utf-8")
+        SCRIPT_PATH.write_text(new_text, encoding="utf-8")
+        log(f"脚本配置已更新,备份到 {bak}")
+        return True
+
+# ============== Ofelia 配置管理 ==============
+_ofelia_lock = threading.Lock()
+def read_ofelia_jobs():
+    """用 configparser 解析 ofelia.ini 中的 [job-exec "xxx"] 段。"""
+    if not OFELIA_INI.exists():
+        return []
+    cfg = configparser.ConfigParser()
+    # 保留大小写
+    cfg.optionxform = str
+    try:
+        cfg.read(OFELIA_INI, encoding="utf-8")
+    except Exception as e:
+        log(f"读 ofelia.ini 失败: {e}", level=logging.ERROR)
+        return []
+    jobs = []
+    for section in cfg.sections():
+        if section.startswith("job-exec") or section.startswith("job-run") or section.startswith("job-local"):
+            sec = cfg[section]
+            # 从段标题解析名字,例:job-exec "compress-surveillance" -> compress-surveillance
+            m = re.match(r'^job-\w+\s+["\']([^"\']+)["\']', section)
+            derived_name = m.group(1) if m else section
+            jobs.append({
+                "section":   section,
+                "name":      sec.get("name") or derived_name,
+                "schedule":  sec.get("schedule", ""),
+                "container": sec.get("container", ""),
+                "command":   sec.get("command", ""),
+            })
+    return jobs
+
+def update_ofelia_jobs(jobs: list):
+    """重写 ofelia.ini 中的所有 job-exec 段,保留其他内容(注释等)。"""
+    with _ofelia_lock:
+        # 备份
+        if OFELIA_INI.exists():
+            OFELIA_BAK.write_text(OFELIA_INI.read_text(encoding="utf-8"), encoding="utf-8")
+        # 重建:把文件按段拆分,只替换 [job-exec ...] 段
+        text = OFELIA_INI.read_text(encoding="utf-8") if OFELIA_INI.exists() else ""
+        # 简单处理:行级扫描,把 job-exec 段替换成新内容
+        lines = text.splitlines()
+        out = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            if stripped.startswith("[job-") and stripped.endswith("]"):
+                # 跳到段尾
+                i += 1
+                while i < len(lines) and lines[i].strip() and not lines[i].strip().startswith("["):
+                    i += 1
+                continue
+            out.append(line)
+            i += 1
+        # 删除所有原 job- 段后的空行(连续空行合并)
+        # 简化:直接重写文件,只保留头部注释
+        header_lines = []
+        for ln in out:
+            if ln.strip().startswith("["):
+                break
+            header_lines.append(ln)
+        # 去除尾部空行
+        while header_lines and not header_lines[-1].strip():
+            header_lines.pop()
+
+        new_text = "\n".join(header_lines) + "\n\n"
+        for job in jobs:
+            sec_name = job.get("section") or f'job-exec "{job.get("name","job")}"'
+            new_text += f"[{sec_name}]\n"
+            if job.get("name"):
+                new_text += f"name      = {job['name']}\n"
+            new_text += f"schedule  = {job.get('schedule','')}\n"
+            new_text += f"container = {job.get('container','')}\n"
+            new_text += f"command   = {job.get('command','')}\n\n"
+
+        OFELIA_INI.write_text(new_text, encoding="utf-8")
+        log(f"ofelia.ini 已重写,任务数: {len(jobs)}")
+        return True
+
+def restart_ofelia():
+    """通过 sudo 免密重启 ofelia 容器。需要 sudoers 配置 NOPASSWD。"""
+    cmd = ["sudo", "-n", "docker", "restart", "ofelia-scheduler"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            return True, f"ofelia 已重启: {r.stdout.strip() or 'OK'}"
+        msg = (r.stderr or r.stdout or "").strip() or f"退出码 {r.returncode}"
+        if r.returncode != 0 and "password" in msg.lower():
+            msg += "\n提示: 需 sudoers 配置免密: kxrdyf ALL=(root) NOPASSWD: /usr/bin/docker restart ofelia-scheduler"
+        return False, f"重启失败: {msg}"
+    except FileNotFoundError:
+        return False, "未找到 sudo 或 docker，请手动执行: docker restart ofelia-scheduler"
+    except Exception as e:
+        return False, f"重启失败: {e}"
+
+# ============== Cron 表达式:计算下一次运行时间 ==============
+def cron_next_run(expr: str, base: datetime = None) -> str:
+    """简易 cron 计算:支持标准 5 字段(m h dom mon dow)。返回 'YYYY-MM-DD HH:MM:SS' 或 'invalid'。"""
+    if not expr or not expr.strip():
+        return ""
+    parts = expr.split()
+    if len(parts) != 5:
+        return "invalid"
+    minute, hour, dom, month, dow = parts
+    base = base or datetime.now()
+
+    def parse_field(field, lo, hi):
+        field = field.strip()
+        # 支持 * / , -
+        if field == "*":
+            return set(range(lo, hi + 1))
+        vals = set()
+        for part in field.split(","):
+            step = 1
+            if "/" in part:
+                part, s = part.split("/", 1)
+                step = int(s)
+            if part == "*":
+                rng = range(lo, hi + 1, step)
+            elif "-" in part:
+                a, b = part.split("-", 1)
+                rng = range(int(a), int(b) + 1, step)
+            else:
+                start = int(part)
+                end = hi if step > 1 else start
+                rng = range(start, end + 1, step)
+            for v in rng:
+                if lo <= v <= hi:
+                    vals.add(v)
+        return vals
+
+    try:
+        mins   = parse_field(minute, 0, 59)
+        hours  = parse_field(hour,   0, 23)
+        doms   = parse_field(dom,    1, 31)
+        months = parse_field(month,  1, 12)
+        dows   = parse_field(dow,    0, 6)
+    except Exception:
+        return "invalid"
+
+    # cron: dow 0=Sun;Python: weekday() 0=Mon... 转
+    py_dows = set((d + 6) % 7 for d in dows)  # cron 0->py 6
+    # 搜索未来 366 天
+    cur = base.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    for _ in range(366 * 24 * 60):
+        if cur.month in months and cur.day in doms and cur.weekday() in py_dows and cur.hour in hours and cur.minute in mins:
+            return cur.strftime("%Y-%m-%d %H:%M:%S")
+        cur += timedelta(minutes=1)
+    return "invalid"
+
+# ============== 系统信息 ==============
+def detect_hwaccel_hint():
+    """复用脚本里的探测逻辑(简化版),给前端一个 hint。"""
+    hints = []
+    if os.path.exists("/dev/mpp_service"):
+        hints.append("rkmpp 设备存在")
+    if os.path.exists("/dev/dri/renderD128"):
+        hints.append("VAAPI 可用")
+    for cand in ["/usr/local/bin/ffmpeg-rkmpp", "/usr/local/rkmpp/ffmpeg",
+                 "/ugreen/@appstore/com.ugreen.transcode/lib/ffmpeg", "/usr/local/bin/ffmpeg"]:
+        if os.path.exists(cand) and os.access(cand, os.X_OK):
+            hints.append(f"ffmpeg: {cand}")
+            return hints
+    hints.append("ffmpeg 未找到")
+    return hints
+
+def ffmpeg_version():
+    for cand in ["/usr/local/bin/ffmpeg-rkmpp", "/usr/local/rkmpp/ffmpeg",
+                 "/ugreen/@appstore/com.ugreen.transcode/lib/ffmpeg", "/usr/local/bin/ffmpeg"]:
+        if os.path.exists(cand) and os.access(cand, os.X_OK):
+            try:
+                r = subprocess.run([cand, "-version"], capture_output=True, text=True, timeout=5)
+                return cand, r.stdout.splitlines()[0] if r.stdout else "(empty)"
+            except Exception:
+                return cand, "(运行失败)"
+    return None, "未找到 ffmpeg"
+
+# ============== HTTP 路由 ==============
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        # 静默访问日志(我们自己 log)
+        pass
+
+    def _serve_file(self, path, ctype="text/plain"):
+        try:
+            data = Path(path).read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+        except FileNotFoundError:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_GET(self):
+        url = urlparse(self.path)
+        path = url.path
+        qs = parse_qs(url.query)
+
+        # 静态
+        if path == "/" or path == "/index.html":
+            return self._serve_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
+        if path.startswith("/static/"):
+            rel = path[len("/static/"):]
+            full = STATIC_DIR / rel
+            if not str(full.resolve()).startswith(str(STATIC_DIR.resolve())):
+                return self.send_error(403)
+            ctype = "application/javascript" if rel.endswith(".js") else \
+                    "text/css" if rel.endswith(".css") else \
+                    "image/png" if rel.endswith(".png") else \
+                    "image/svg+xml" if rel.endswith(".svg") else \
+                    "text/plain"
+            return self._serve_file(full, ctype)
+
+        # API
+        if path == "/api/status":
+            st = get_state()
+            st["log_lines"] = sum(1 for _ in open(SCRIPT_LOG, encoding="utf-8", errors="replace")) if SCRIPT_LOG.exists() else 0
+            st["lock_exists"] = SCRIPT_LOCK.exists()
+            # 加一个提示信息
+            if st["running"] and st.get("external"):
+                st["hint"] = "检测到外部任务在运行(从终端启动),可在「任务」页停止"
+            elif st["running"]:
+                st["hint"] = "任务运行中"
+            else:
+                st["hint"] = "空闲,可以从「任务」页启动"
+            return json_response(self, 200, st)
+
+        if path == "/api/current-file":
+            update_current_file()
+            return json_response(self, 200, {"current_file": get_state()["current_file"]})
+
+        if path == "/api/logs":
+            since  = int(qs.get("since",  ["0"])[0])
+            limit  = int(qs.get("limit",  ["500"])[0])
+            level  = (qs.get("level", ["all"])[0] or "all")
+            search = (qs.get("q",     [None])[0] or None)
+            try:
+                max_lines = int(qs.get("max_lines", ["5000"])[0])
+            except ValueError:
+                max_lines = 5000
+            result, total = read_log_tail(
+                limit=limit, since=since,
+                level=level, search=search,
+                max_lines=max_lines,
+            )
+            # result 是 [(line_no, text), ...], 转 lines + line_nos
+            lines = [t for _, t in result]
+            line_nos = [n for n, _ in result]
+            return json_response(self, 200, {
+                "lines": lines,
+                "line_nos": line_nos,
+                "total": total,
+                "level": level,
+                "search": search,
+            })
+
+        if path == "/api/logs/download":
+            # 原始文件下载
+            try:
+                body = SCRIPT_LOG.read_bytes() if SCRIPT_LOG.exists() else b""
+            except OSError as e:
+                return self.send_error(500, str(e))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Disposition",
+                             f'attachment; filename="compress-{time.strftime("%Y%m%d-%H%M%S")}.log"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if path == "/api/files/input":
+            return json_response(self, 200, {"files": list_files(INPUT_DIR)})
+        if path == "/api/files/output":
+            return json_response(self, 200, {"files": list_files(OUTPUT_DIR)})
+
+        if path == "/api/stats":
+            return json_response(self, 200, get_stats())
+
+        if path == "/api/history":
+            limit = int(qs.get("limit", ["20"])[0])
+            return json_response(self, 200, {"runs": get_history(limit)})
+
+        if path == "/api/config":
+            cfg, _ = read_script_config()
+            return json_response(self, 200, {"config": cfg, "keys": CONFIG_KEYS})
+
+        if path == "/api/cron":
+            jobs = read_ofelia_jobs()
+            for j in jobs:
+                j["next_run"] = cron_next_run(j.get("schedule", ""))
+            return json_response(self, 200, {"jobs": jobs, "ini_path": str(OFELIA_INI)})
+
+        if path == "/api/system":
+            ff, ver = ffmpeg_version()
+            return json_response(self, 200, {
+                "ffmpeg":  ff,
+                "ffmpeg_version": ver,
+                "hints":   detect_hwaccel_hint(),
+                "input_dir":  str(INPUT_DIR),
+                "output_dir": str(OUTPUT_DIR),
+                "script":     str(SCRIPT_PATH),
+                "script_log": str(SCRIPT_LOG),
+            })
+
+        if path == "/api/disk":
+            return json_response(self, 200, disk_usage())
+
+        # ===== 任务队列 =====
+        if path == "/api/queue":
+            qs = parse_qs(url.query)
+            status   = (qs.get("status",   [None])[0] or None)
+            sort_by  = (qs.get("sort_by",  [None])[0] or None)
+            sort_dir = (qs.get("sort_dir", ["desc"])[0] or "desc")
+            search   = (qs.get("q",        [None])[0] or None)
+            try:
+                limit  = int(qs.get("limit",  ["200"])[0])
+                offset = int(qs.get("offset", ["0"])[0])
+            except ValueError:
+                limit, offset = 200, 0
+            items, total = list_tasks(
+                status=status, limit=limit, offset=offset,
+                sort_by=sort_by, sort_dir=sort_dir, search=search,
+            )
+            return json_response(self, 200, {
+                "items": items, "total": total,
+                "limit": limit, "offset": offset,
+                "status": status, "sort_by": sort_by, "sort_dir": sort_dir,
+                "search": search,
+            })
+
+        if path == "/api/queue/stats":
+            return json_response(self, 200, get_queue_stats())
+
+        if path == "/api/cron/status":
+            # 检查 ofelia 容器状态
+            state = "unknown"
+            try:
+                r = subprocess.run(
+                    ["docker", "ps", "-a", "--filter", "name=ofelia-scheduler",
+                     "--format", "{{.Names}} {{.State}}"],
+                    capture_output=True, text=True, timeout=3,
+                )
+                line = r.stdout.strip()
+                if not line:
+                    state = "absent"
+                else:
+                    parts = line.split()
+                    state = parts[1] if len(parts) > 1 else "unknown"
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                state = "docker_unavailable"
+            except Exception as e:
+                state = f"error:{e}"
+            return json_response(self, 200, {"state": state})
+
+        return self.send_error(404)
+
+    def do_POST(self):
+        url = urlparse(self.path)
+        path = url.path
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length).decode("utf-8") if length else "{}"
+        try:
+            data = json.loads(body) if body else {}
+        except Exception:
+            data = {}
+
+        if path == "/api/run":
+            ok, msg = start_run(trigger=data.get("trigger", "manual"))
+            return json_response(self, 200, {"ok": ok, "message": msg, "state": get_state()})
+
+        if path == "/api/stop":
+            ok, msg = stop_run()
+            return json_response(self, 200, {"ok": ok, "message": msg, "state": get_state()})
+
+        if path == "/api/config":
+            ok = update_script_config(data.get("config", {}))
+            cfg, _ = read_script_config()
+            return json_response(self, 200, {"ok": ok, "config": cfg})
+
+        if path == "/api/cron":
+            jobs = data.get("jobs", [])
+            ok = update_ofelia_jobs(jobs)
+            new_jobs = read_ofelia_jobs()
+            for j in new_jobs:
+                j["next_run"] = cron_next_run(j.get("schedule", ""))
+            return json_response(self, 200, {"ok": ok, "jobs": new_jobs})
+
+        if path == "/api/cron/restart":
+            ok, msg = restart_ofelia()
+            return json_response(self, 200, {"ok": ok, "message": msg})
+
+        # ===== 任务队列 POST =====
+        if path == "/api/queue/sync":
+            try:
+                r = sync_tasks_from_input()
+                return json_response(self, 200, {"ok": True, "synced": r, "stats": get_queue_stats()})
+            except Exception as e:
+                return json_response(self, 500, {"ok": False, "error": str(e)})
+
+        if path == "/api/queue/retry":
+            ids = data.get("ids", [])
+            if not isinstance(ids, list):
+                return json_response(self, 400, {"ok": False, "error": "ids must be list"})
+            try:
+                ids = [int(x) for x in ids]
+            except (TypeError, ValueError):
+                return json_response(self, 400, {"ok": False, "error": "ids must be integers"})
+            try:
+                r = retry_tasks(ids)
+                return json_response(self, 200, {"ok": True, "result": r, "stats": get_queue_stats()})
+            except Exception as e:
+                return json_response(self, 500, {"ok": False, "error": str(e)})
+
+        if path == "/api/queue/backfill_durations":
+            try:
+                result = backfill_task_durations()
+                return json_response(self, 200, {"ok": True, "result": result})
+            except Exception as e:
+                return json_response(self, 500, {"ok": False, "error": str(e)})
+
+        if path == "/api/queue/delete":
+            ids = data.get("ids", [])
+            if not isinstance(ids, list):
+                return json_response(self, 400, {"ok": False, "error": "ids must be list"})
+            try:
+                ids = [int(x) for x in ids]
+            except (TypeError, ValueError):
+                return json_response(self, 400, {"ok": False, "error": "ids must be integers"})
+            try:
+                r = delete_tasks(ids)
+                return json_response(self, 200, {"ok": True, "result": r, "stats": get_queue_stats()})
+            except Exception as e:
+                return json_response(self, 500, {"ok": False, "error": str(e)})
+
+        return self.send_error(404)
+
+# ============== 任务队列(tasks 表) ==============
+QUEUE_STATUSES = ("pending", "running", "done", "failed", "skipped")
+
+def _walk_mp4(root: Path):
+    """遍历 root 下所有 *.mp4,跟随符号链接。yield (rel_path, full_path, size)。"""
+    try:
+        root_real = root.resolve()
+    except (OSError, RuntimeError):
+        return
+    for dirpath, _dirs, files in os.walk(root_real, followlinks=True):
+        for fn in files:
+            if not fn.endswith(".mp4") or fn.endswith(".tmp.mp4"):
+                continue
+            full = Path(dirpath) / fn
+            try:
+                st = full.stat()
+                rel = str(full.relative_to(root_real))
+            except (OSError, ValueError):
+                continue
+            yield rel, full, st.st_size
+
+def sync_tasks_from_input() -> dict:
+    """从 /input 和 /output 扫描,同步 tasks 表。返回本次新增/更新的统计。"""
+    added_input = added_done = updated_done = reconciled = 0
+    # 先一轮走,把 /input 和 /output 里的 rel_path 收齐
+    input_seen: set[str]  = set()
+    output_seen: set[str] = set()
+    for rel, _full, size in _walk_mp4(INPUT_DIR):
+        input_seen.add(rel)
+    for rel, _full, size in _walk_mp4(OUTPUT_DIR):
+        output_seen.add(rel)
+
+    with db() as conn, _db_lock:
+        # 1. /input 里在的 -> pending(如果不存在或不是 done)
+        for rel in input_seen:
+            row = conn.execute(
+                "SELECT id, status FROM tasks WHERE rel_path=?", (rel,)
+            ).fetchone()
+            if row is None:
+                # 拿不到 size (上面的扫描丢了),读 -1 占位
+                try:
+                    size = (INPUT_DIR / rel).stat().st_size
+                except OSError:
+                    size = 0
+                conn.execute(
+                    "INSERT INTO tasks(rel_path, size, status) VALUES(?, ?, 'pending')",
+                    (rel, size),
+                )
+                added_input += 1
+            elif row["status"] in ("done", "skipped"):
+                # 保持原状态
+                pass
+        # 2. /output 里有 -> done(如果还没标记)
+        for rel in output_seen:
+            row = conn.execute(
+                "SELECT id, status FROM tasks WHERE rel_path=?", (rel,)
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO tasks(rel_path, size, status) VALUES(?, ?, 'done')",
+                    (rel, 0),
+                )
+                added_done += 1
+            elif row["status"] not in ("done",):
+                conn.execute(
+                    "UPDATE tasks SET status='done', ended_at=COALESCE(ended_at,?) WHERE id=?",
+                    (now_str(), row["id"]),
+                )
+                updated_done += 1
+        # 3. 调和:既不在 /input 也不在 /output 的 pending/running 任务 → skipped
+        # (说明文件已经被外部删了——常见: 旧 bash 处理过、用户手动 rm、清理例行任务)
+        rows = conn.execute(
+            "SELECT id, rel_path FROM tasks WHERE status IN ('pending','running')"
+        ).fetchall()
+        for r in rows:
+            if r["rel_path"] not in input_seen and r["rel_path"] not in output_seen:
+                conn.execute(
+                    "UPDATE tasks SET status='skipped', "
+                    "ended_at=?, "
+                    "last_error=COALESCE(last_error,'reconciled: file gone from both input and output') "
+                    "WHERE id=?",
+                    (now_str(), r["id"]),
+                )
+                reconciled += 1
+        conn.commit()
+    return {
+        "added_input":  added_input,
+        "added_done":   added_done,
+        "updated_done": updated_done,
+        "reconciled":   reconciled,
+    }
+
+def get_queue_stats() -> dict:
+    with db() as conn, _db_lock:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
+        ).fetchall()
+    counts = {s: 0 for s in QUEUE_STATUSES}
+    for r in rows:
+        counts[r["status"]] = r["n"]
+    total = sum(counts.values())
+    return {**counts, "total": total}
+
+# 允许排序的列(防 SQL 注入)
+_SORTABLE_COLS = {
+    "id", "rel_path", "size", "output_size",
+    "attempts", "status", "ended_at",
+    "duration_sec", "ratio",   # 表达式列,在 SELECT 里定义
+}
+
+def list_tasks(status=None, limit=200, offset=0,
+               sort_by=None, sort_dir="desc", search=None):
+    if status and status not in QUEUE_STATUSES:
+        return [], 0
+    if sort_by not in _SORTABLE_COLS:
+        sort_by = None
+    sort_dir = "desc" if sort_dir not in ("asc", "desc") else sort_dir
+
+    # WHERE 构造
+    where_clauses = []
+    where_params  = []
+    if status and status in QUEUE_STATUSES:
+        where_clauses.append("status=?")
+        where_params.append(status)
+    if search:
+        where_clauses.append("rel_path LIKE ?")
+        where_params.append(f"%{search}%")
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    # ORDER BY
+    if sort_by is None:
+        order_sql = """ORDER BY
+            CASE status
+                WHEN 'running' THEN 0
+                WHEN 'failed'  THEN 1
+                WHEN 'pending' THEN 2
+                WHEN 'skipped' THEN 3
+                ELSE 4
+            END,
+            id DESC"""
+    else:
+        dir_sql = "DESC" if sort_dir == "desc" else "ASC"
+        # NULL 值统一排到末尾
+        order_sql = f"""ORDER BY
+            CASE WHEN {sort_by} IS NULL THEN 1 ELSE 0 END,
+            {sort_by} {dir_sql}, id DESC"""
+
+    # 用 SQL 计算 duration_sec 和 ratio,方便 ORDER BY 使用
+    select_sql = """SELECT id, rel_path, size, output_size, status, attempts,
+                            last_error, last_run_id,
+                            created_at, started_at, ended_at,
+                            CASE WHEN started_at IS NULL OR ended_at IS NULL
+                                 THEN NULL
+                                 ELSE CAST((julianday(ended_at) - julianday(started_at)) * 86400 AS INTEGER)
+                            END AS duration_sec,
+                            CASE WHEN size IS NULL OR size = 0 OR output_size IS NULL
+                                 THEN NULL
+                                 ELSE ROUND(output_size * 1.0 / size, 3)
+                            END AS ratio
+                     FROM tasks"""
+
+    with db() as conn, _db_lock:
+        total = conn.execute(
+            f"SELECT COUNT(*) AS n FROM tasks {where_sql}", where_params
+        ).fetchone()["n"]
+        rows = conn.execute(
+            f"{select_sql} {where_sql} {order_sql} LIMIT ? OFFSET ?",
+            where_params + [limit, offset],
+        ).fetchall()
+
+    items = []
+    for r in rows:
+        d = dict(r)
+        # ratio 可能是 0(空表达式), 也允许
+        items.append(d)
+    return items, total
+
+def retry_tasks(ids: list) -> dict:
+    """重试指定任务: 删除对应 /output 文件,重置状态为 pending。"""
+    if not ids:
+        return {"reset": 0, "deleted_outputs": 0, "not_found": 0}
+    reset = deleted = 0
+    not_found = []
+    with db() as conn, _db_lock:
+        for tid in ids:
+            row = conn.execute(
+                "SELECT id, rel_path, status FROM tasks WHERE id=?", (tid,)
+            ).fetchone()
+            if row is None:
+                not_found.append(tid)
+                continue
+            output_file = OUTPUT_DIR / row["rel_path"]
+            try:
+                if output_file.exists():
+                    output_file.unlink()
+                    deleted += 1
+            except OSError as e:
+                log(f"retry_tasks: 删除输出失败 {output_file}: {e}")
+            conn.execute(
+                """UPDATE tasks SET status='pending', attempts=0,
+                                     last_error=NULL,
+                                     started_at=NULL, ended_at=NULL
+                   WHERE id=?""",
+                (row["id"],),
+            )
+            reset += 1
+        conn.commit()
+    return {"reset": reset, "deleted_outputs": deleted, "not_found": len(not_found)}
+
+def backfill_task_durations() -> dict:
+    """回填历史 done 任务的 started_at / ended_at。
+
+    旧 bash 管线处理的 /output 文件被首次 sync_tasks_from_input() 导入时,
+    /output 已存在 → status='done' + ended_at=sync_time, 但真实压缩开始时间
+    完全没记录。导致 UI 队列的「用时」列对 ~3000 个历史任务显示「—」。
+
+    思路:
+      - 用 /output mtime 作为真实 ended_at(压缩完成时刻)
+      - started_at = ended_at - 估算时长;估算时长 = clamp(size/throughput, 30s, 30min)
+      - throughput 从已完成任务的真实数据中位数算出 (≈1.1 MB/s, libx264)
+    对 idle 异常(duration < 30s 或 > 30min)的也重写。
+    Idempotent: WHERE started_at IS NULL 只补一次,后续靠时长区间修正。
+    """
+    from datetime import datetime as _dt
+    with db() as conn, _db_lock:
+        row = conn.execute("""
+            SELECT AVG(size * 1.0 / CAST((julianday(ended_at) - julianday(started_at)) * 86400 AS INTEGER)) AS bps,
+                   COUNT(*) AS n
+            FROM tasks
+            WHERE status='done' AND started_at IS NOT NULL AND ended_at IS NOT NULL
+              AND size > 0
+              AND CAST((julianday(ended_at) - julianday(started_at)) * 86400 AS INTEGER) BETWEEN 30 AND 1800
+        """).fetchone()
+        bps = row["bps"] if row["bps"] and row["bps"] > 0 else 1_000_000
+        log(f"backfill_durations: 吞吐率 {bps/1024/1024:.2f} MB/s (样本 {row['n']} 个)")
+
+        # 候选 1:started_at IS NULL 的 done 任务
+        targets = conn.execute("""
+            SELECT id, rel_path, size FROM tasks
+            WHERE status='done' AND started_at IS NULL
+        """).fetchall()
+        # 候选 2:duration 异常的 done 任务(< 30s 或 > 30min)
+        bad = conn.execute("""
+            SELECT id, rel_path, size FROM tasks
+            WHERE status='done' AND started_at IS NOT NULL AND ended_at IS NOT NULL
+              AND (CAST((julianday(ended_at) - julianday(started_at)) * 86400 AS INTEGER) < 30
+                   OR CAST((julianday(ended_at) - julianday(started_at)) * 86400 AS INTEGER) > 1800)
+        """).fetchall()
+
+    all_rows = targets + bad
+    fixed_null = fixed_bad = no_output = 0
+    seen_ids = set()
+    for tid, rel, size in all_rows:
+        if tid in seen_ids:
+            continue
+        seen_ids.add(tid)
+        out = OUTPUT_DIR / rel
+        if not out.exists():
+            no_output += 1
+            continue
+        try:
+            mtime = out.stat().st_mtime
+        except OSError:
+            continue
+        if size and size > 0:
+            duration = int(size / bps)
+        else:
+            duration = 120
+        duration = max(30, min(duration, 1800))
+        start_ts = mtime - duration
+        ended_at   = _dt.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+        started_at = _dt.fromtimestamp(start_ts).strftime("%Y-%m-%d %H:%M:%S")
+        with db() as conn2, _db_lock:
+            cur = conn2.execute(
+                "UPDATE tasks SET started_at=?, ended_at=? WHERE id=?",
+                (started_at, ended_at, tid),
+            )
+            conn2.commit()
+            if cur.rowcount > 0:
+                if tid in {r[0] for r in targets}:
+                    fixed_null += 1
+                else:
+                    fixed_bad += 1
+    log(f"backfill_durations: fixed_null={fixed_null} fixed_bad={fixed_bad} no_output={no_output}")
+    return {
+        "fixed_null": fixed_null,
+        "fixed_bad":  fixed_bad,
+        "no_output":  no_output,
+        "bytes_per_sec": bps,
+    }
+
+def delete_tasks(ids: list) -> dict:
+    """删除指定 tasks 记录（仅删除表行,不动 /input /output 文件）。"""
+    if not ids:
+        return {"deleted": 0, "not_found": 0, "rejected": 0}
+    deleted = not_found = rejected = 0
+    rejected_ids = []
+    with db() as conn, _db_lock:
+        for tid in ids:
+            row = conn.execute(
+                "SELECT id, status FROM tasks WHERE id=?", (tid,)
+            ).fetchone()
+            if row is None:
+                not_found += 1
+                continue
+            if row["status"] == "running":
+                # 拒绝删除正在跑的任务(避免中断 worker)
+                rejected += 1
+                rejected_ids.append(tid)
+                continue
+            conn.execute("DELETE FROM tasks WHERE id=?", (tid,))
+            deleted += 1
+        conn.commit()
+    return {
+        "deleted": deleted,
+        "not_found": not_found,
+        "rejected": rejected,
+        "rejected_ids": rejected_ids,
+    }
+
+# ============== 文件列表 ==============
+def list_files(dir_path: Path):
+    if not dir_path.exists():
+        return {"exists": False, "items": []}
+    items = []
+    try:
+        for p in dir_path.rglob("*.mp4"):
+            try:
+                st = p.stat()
+                items.append({
+                    "path":  str(p.relative_to(dir_path)),
+                    "size":  st.st_size,
+                    "mtime": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                })
+            except Exception:
+                continue
+    except Exception as e:
+        return {"exists": True, "items": [], "error": str(e)}
+    items.sort(key=lambda x: x["mtime"], reverse=True)
+    total_size = sum(i["size"] for i in items)
+    return {
+        "exists": True,
+        "items": items,
+        "count": len(items),
+        "total_size": total_size,
+        "total_size_h": human_size(total_size),
+    }
+
+def human_size(n):
+    for u in ["B","K","M","G","T"]:
+        if n < 1024:
+            return f"{n:.1f}{u}"
+        n /= 1024
+    return f"{n:.1f}P"
+
+def disk_usage():
+    out = {}
+    for label, p in [("input", INPUT_DIR), ("output", OUTPUT_DIR), ("scripts", SCRIPT_PATH.parent)]:
+        try:
+            st = os.statvfs(str(p))
+            total = st.f_blocks * st.f_frsize
+            free  = st.f_bavail * st.f_frsize
+            used  = total - free
+            out[label] = {
+                "total": total, "used": used, "free": free,
+                "total_h": human_size(total), "used_h": human_size(used), "free_h": human_size(free),
+                "percent": round(used * 100 / total, 1) if total else 0,
+            }
+        except Exception as e:
+            out[label] = {"error": str(e)}
+    return out
+
+# ============== 统计 ==============
+def get_stats():
+    out = {"today": {}, "total": {}, "recent": []}
+    with db() as conn, _db_lock:
+        for window, label in [("today", "今日"), ("all", "总计")]:
+            if window == "today":
+                where = "WHERE date(started_at) = date('now','localtime') AND ended_at IS NOT NULL"
+            else:
+                where = "WHERE ended_at IS NOT NULL"
+            r = conn.execute(f"""
+                SELECT COUNT(*) AS runs,
+                       COALESCE(SUM(success),0) AS success,
+                       COALESCE(SUM(skipped),0) AS skipped,
+                       COALESCE(SUM(failed),0)  AS failed,
+                       COALESCE(SUM(total),0)   AS total
+                FROM runs {where}
+            """).fetchone()
+            out["today" if window=="today" else "total"] = {
+                "runs":    r["runs"],
+                "success": r["success"],
+                "skipped": r["skipped"],
+                "failed":  r["failed"],
+                "total":   r["total"],
+            }
+        out["recent"] = [dict(row) for row in conn.execute(
+            "SELECT id, started_at, ended_at, trigger, success, skipped, failed, total FROM runs ORDER BY id DESC LIMIT 10"
+        ).fetchall()]
+    return out
+
+def get_history(limit=20):
+    with db() as conn, _db_lock:
+        rows = conn.execute(
+            "SELECT id, started_at, ended_at, trigger, success, skipped, failed, total FROM runs ORDER BY id DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+# ============== main ==============
+def main():
+    init_db()
+    log(f"启动: 监听 {HOST}:{PORT}")
+    srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+if __name__ == "__main__":
+    main()

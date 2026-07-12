@@ -1,0 +1,8 @@
+/* 微调:让某些元素更顺眼 */
+html, body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Roboto, "Helvetica Neue", sans-serif; }
+
+#log-view::-webkit-scrollbar { width: 10px; height: 10px; }
+#log-view::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+#log-view::-webkit-scrollbar-track { background: #1e293b; }
+
+table th { user-select: none; }
