@@ -569,13 +569,29 @@
 
     <!-- 集群文件 -->
     <div id="cluster-files" class="hidden space-y-4">
-      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200 flex flex-wrap items-center gap-3">
-        <span class="text-sm font-medium">目录:</span>
-        <div class="flex gap-1">
-          <button id="cf-dir-output" onclick="loadClusterFiles('output')" class="px-3 py-1 rounded bg-blue-100 text-blue-700 text-xs">输出</button>
-          <button id="cf-dir-input"  onclick="loadClusterFiles('input')"  class="px-3 py-1 rounded bg-slate-100 text-slate-600 text-xs">输入</button>
+      <!-- 面包屑 + 搜索 + 每页大小 -->
+      <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-3 space-y-2">
+        <div class="flex flex-wrap items-center gap-2 text-sm">
+          <span class="text-slate-500">📂</span>
+          <span class="font-mono">video-manager://</span>
+          <button id="cf-crumb-output" onclick="cfSetDir('output')" class="font-medium text-blue-600 hover:underline">output</button>
+          <span class="text-slate-400">/</span>
+          <button id="cf-crumb-input"  onclick="cfSetDir('input')"  class="font-medium text-slate-600 hover:underline">input</button>
+          <span class="ml-auto"></span>
+          <span class="text-xs text-slate-500">每页</span>
+          <select id="cf-page-size" onchange="cfSetPageSize(+this.value)" class="text-xs border border-slate-300 rounded px-1 py-0.5">
+            <option value="20">20</option>
+            <option value="50" selected>50</option>
+            <option value="100">100</option>
+            <option value="0">全部</option>
+          </select>
         </div>
-        <button onclick="loadClusterFiles(_clusterFilesDir || 'output')" class="ml-auto px-3 py-1 rounded bg-slate-100 hover:bg-slate-200 text-xs">刷新</button>
+        <div class="flex items-center gap-2">
+          <input id="cf-search" type="text" placeholder="🔍 搜索文件名 (如 14:38 或 14:38:00)"
+            oninput="cfDebounceSearch(this.value)" autocomplete="off"
+            class="flex-1 min-w-[180px] border border-slate-300 rounded-md px-2 py-1.5 text-sm">
+          <button onclick="document.getElementById('cf-search').value=''; cfDoSearch('')" class="text-xs text-slate-500 hover:text-slate-900 px-2">清空</button>
+        </div>
       </div>
       <div id="cluster-files-content" class="space-y-3">
         <div class="text-center py-6 text-slate-400">加载中...</div>

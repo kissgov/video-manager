@@ -1423,9 +1423,23 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/files/input":
-            return json_response(self, 200, {"files": list_files(INPUT_DIR)})
+            return json_response(self, 200, {"files": list_files(
+                INPUT_DIR,
+                q=qs.get("q", [""])[0],
+                sort=qs.get("sort", ["mtime"])[0],
+                order=qs.get("order", ["desc"])[0],
+                page=int(qs.get("page", ["1"])[0]),
+                page_size=int(qs.get("page_size", ["0"])[0]),
+            )})
         if path == "/api/files/output":
-            return json_response(self, 200, {"files": list_files(OUTPUT_DIR)})
+            return json_response(self, 200, {"files": list_files(
+                OUTPUT_DIR,
+                q=qs.get("q", [""])[0],
+                sort=qs.get("sort", ["mtime"])[0],
+                order=qs.get("order", ["desc"])[0],
+                page=int(qs.get("page", ["1"])[0]),
+                page_size=int(qs.get("page_size", ["0"])[0]),
+            )})
 
         # ---- 视频流(支持 Range,允许跨源播放)----
         if path == "/api/files/stream":
@@ -1542,7 +1556,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/cluster/files":
             return json_response(self, 200,
-                _cluster_aggregate_files(qs.get("dir", ["output"])[0]))
+                _cluster_aggregate_files(
+                    qs.get("dir", ["output"])[0],
+                    q=qs.get("q", [""])[0],
+                    sort=qs.get("sort", ["mtime"])[0],
+                    order=qs.get("order", ["desc"])[0],
+                    page=int(qs.get("page", ["1"])[0]),
+                    page_size=int(qs.get("page_size", ["0"])[0]),
+                ))
 
         # ---- 代理:透过本节点转播远端 peer 的视频流(处理 HTTPS Mixed Content)----
         if path == "/api/cluster/stream":
@@ -1673,7 +1694,14 @@ class Handler(BaseHTTPRequestHandler):
         # ---- 集群文件聚合 ----
         if path == "/api/cluster/files":
             dir_param = (data.get("dir") if data else None) or qs.get("dir", ["output"])[0]
-            return json_response(self, 200, _cluster_aggregate_files(dir_param))
+            return json_response(self, 200, _cluster_aggregate_files(
+                dir_param,
+                q=(data.get("q") if data else None) or qs.get("q", [""])[0],
+                sort=(data.get("sort") if data else None) or qs.get("sort", ["mtime"])[0],
+                order=(data.get("order") if data else None) or qs.get("order", ["desc"])[0],
+                page=int((data.get("page") if data else None) or qs.get("page", ["1"])[0]),
+                page_size=int((data.get("page_size") if data else None) or qs.get("page_size", ["0"])[0]),
+            ))
 
         # ---- 集群节点对远端文件的代理操作(删除/下载)----
         if path == "/api/cluster/file_action":
@@ -2125,9 +2153,16 @@ def delete_tasks(ids: list) -> dict:
     }
 
 # ============== 文件列表 ==============
-def list_files(dir_path: Path):
+def list_files(dir_path: Path, q: str = "", sort: str = "mtime", order: str = "desc", page: int = 1, page_size: int = 0):
+    """列出目录下的 mp4 文件。支持搜索 / 排序 / 分页。
+    q: 文件名模糊匹配(不区分大小写)
+    sort: 'name' | 'size' | 'mtime' | 'path'
+    order: 'asc' | 'desc'
+    page: 1-based
+    page_size: 0 = 不分页(返回全部), >0 按页返
+    """
     if not dir_path.exists():
-        return {"exists": False, "items": []}
+        return {"exists": False, "items": [], "count": 0}
     items = []
     try:
         for p in dir_path.rglob("*.mp4"):
@@ -2138,19 +2173,53 @@ def list_files(dir_path: Path):
                     "size":    st.st_size,
                     "size_h":  human_size(st.st_size),
                     "mtime":   datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                    "mtime_ts": int(st.st_mtime),
                 })
             except Exception:
                 continue
     except Exception as e:
-        return {"exists": True, "items": [], "error": str(e)}
-    items.sort(key=lambda x: x["mtime"], reverse=True)
+        return {"exists": True, "items": [], "count": 0, "error": str(e)}
+    # 过滤
+    if q:
+        q_lower = q.lower().strip()
+        items = [it for it in items if q_lower in it["path"].lower()]
+    # 排序
+    sort_keys = {
+        "name":  lambda x: x["path"].lower(),
+        "size":  lambda x: x["size"],
+        "mtime": lambda x: x["mtime_ts"],
+        "path":  lambda x: x["path"].lower(),
+    }
+    sk = sort_keys.get(sort, sort_keys["mtime"])
+    items.sort(key=sk, reverse=(order == "desc"))
+    # 分页
+    total = len(items)
     total_size = sum(i["size"] for i in items)
+    if page_size and page_size > 0:
+        page = max(1, page)
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = min(page, total_pages)
+        start = (page - 1) * page_size
+        page_items = items[start:start + page_size]
+    else:
+        page_items = items
+        page = 1
+        total_pages = 1
+    # 删 mtime_ts(内部用,不返回前端)
+    for it in page_items:
+        it.pop("mtime_ts", None)
     return {
         "exists": True,
-        "items": items,
-        "count": len(items),
+        "items": page_items,
+        "count": total,            # 过滤后总数
+        "page": page,
+        "page_size": page_size if page_size > 0 else total,
+        "total_pages": total_pages,
         "total_size": total_size,
         "total_size_h": human_size(total_size),
+        "sort": sort,
+        "order": order,
+        "q": q,
     }
 
 def human_size(n):
@@ -2641,13 +2710,15 @@ def start_cluster():
     _cluster_thread.start()
     log("cluster heartbeat thread started")
 
-def _cluster_aggregate_files(dir_name: str) -> dict:
-    """聚合所有 peer 的文件列表(含本机)。dir_name = 'input' | 'output'"""
+def _cluster_aggregate_files(dir_name: str, q: str = "", sort: str = "mtime", order: str = "desc", page: int = 1, page_size: int = 0) -> dict:
+    """聚合所有 peer 的文件列表(含本机)。dir_name = 'input' | 'output'
+    q/sort/order/page/page_size 传给每个 peer
+    """
     result = {"self": None, "peers": [], "dir": dir_name}
     # 本机
     try:
         base = INPUT_DIR if dir_name == "input" else OUTPUT_DIR
-        d = list_files(base)
+        d = list_files(base, q=q, sort=sort, order=order, page=page, page_size=page_size)
         result["self"] = {
             "id": get_self_id(),
             "name": get_self_name(),
@@ -2675,7 +2746,13 @@ def _cluster_aggregate_files(dir_name: str) -> dict:
             "files": None,
         }
         try:
-            url = f"{p['url'].rstrip('/')}/api/files/{dir_name}"
+            qs_parts = [f"dir={dir_name}"]
+            if q:        qs_parts.append(f"q={_urlquote(q)}")
+            if sort and sort != "mtime": qs_parts.append(f"sort={sort}")
+            if order and order != "desc": qs_parts.append(f"order={order}")
+            if page > 1:  qs_parts.append(f"page={page}")
+            if page_size:  qs_parts.append(f"page_size={page_size}")
+            url = f"{p['url'].rstrip('/')}/api/files/{dir_name}?" + "&".join(qs_parts)
             req = _urlreq.Request(url, headers={"User-Agent": "video-manager-cluster/1.0"})
             with _urlreq.urlopen(req, timeout=8) as r:
                 body = r.read().decode("utf-8")
