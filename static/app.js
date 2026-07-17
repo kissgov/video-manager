@@ -60,6 +60,8 @@ function showTab(name) {
   if (name === 'logs')     loadLogs();
   if (name === 'files')    loadFiles();
   if (name === 'config') { loadConfig(); loadSettings(); }
+  if (name === 'cron')    { loadCron(); loadSchedules(); }
+  if (name === 'cluster') loadCluster();
   if (name === 'cron')     loadCron();
   if (name === 'system')   loadSystem();
   if (name === 'queue')    loadQueue();
@@ -1159,3 +1161,289 @@ setInterval(() => {
 // ---- 启动 ----
 showTab('overview');
 loadSystem();
+
+// =====================================================
+// UI 调度（独立于 ofelia 的 Python 后台调度）
+// =====================================================
+async function loadSchedules() {
+  try {
+    const r = await api('/api/schedules');
+    const list = $('#schedules-list');
+    const ss = r.schedules || [];
+    if (ss.length === 0) {
+      list.innerHTML = '<div class="text-center py-6 text-slate-400">还没有调度，点“+ 新增调度”添加</div>';
+      return;
+    }
+    list.innerHTML = ss.map(s => {
+      const status = s.last_status
+        ? (s.last_status === 'fired'
+            ? `<span class="text-green-600">✓ ${escapeHtml(s.last_status)}</span>`
+            : `<span class="text-amber-600">⚠ ${escapeHtml(s.last_status.slice(0, 60))}</span>`)
+        : '<span class="text-slate-400">未运行</span>';
+      const lastRun = s.last_run ? escapeHtml(s.last_run) : '—';
+      const nextRun = s.next_run ? escapeHtml(s.next_run) : '—';
+      return `
+        <div class="flex items-center gap-3 p-3 bg-slate-50 rounded-lg border border-slate-200">
+          <input type="checkbox" ${s.enabled ? 'checked' : ''} onchange="toggleSchedule('${s.id}', this.checked)" class="rounded">
+          <div class="flex-1 min-w-0">
+            <div class="font-medium text-sm">${escapeHtml(s.name)}</div>
+            <div class="font-mono text-xs text-slate-500">${escapeHtml(s.cron_expr)}</div>
+          </div>
+          <div class="text-xs text-slate-500 text-right hidden md:block">
+            <div>下次: <span class="font-mono">${nextRun}</span></div>
+            <div>上次: <span class="font-mono">${lastRun}</span> ${status}</div>
+          </div>
+          <div class="flex gap-1">
+            <button onclick="fireScheduleNow('${s.id}')" title="立即触发" class="px-2 py-1 rounded bg-blue-100 hover:bg-blue-200 text-blue-700 text-xs">▶</button>
+            <button onclick="editSchedule('${escapeHtml(JSON.stringify(s).replace(/'/g, "\\'"))}')" title="编辑" class="px-2 py-1 rounded bg-slate-100 hover:bg-slate-200 text-xs">✎</button>
+            <button onclick="deleteSchedule('${s.id}')" title="删除" class="px-2 py-1 rounded bg-red-100 hover:bg-red-200 text-red-700 text-xs">×</button>
+          </div>
+        </div>`;
+    }).join('');
+  } catch (e) {
+    $('#schedules-list').innerHTML = '<div class="text-red-600 text-sm">加载失败: ' + e.message + '</div>';
+  }
+}
+
+function showScheduleForm() {
+  $('#sched-id').value = '';
+  $('#sched-name').value = '';
+  $('#sched-cron').value = '';
+  $('#sched-enabled').checked = true;
+  $('#sched-preview').textContent = '';
+  $('#schedules-form-wrap').classList.remove('hidden');
+}
+function hideScheduleForm() {
+  $('#schedules-form-wrap').classList.add('hidden');
+}
+function editSchedule(jsonStr) {
+  try {
+    const s = JSON.parse(jsonStr.replace(/&quot;/g, '"'));
+    $('#sched-id').value = s.id;
+    $('#sched-name').value = s.name;
+    $('#sched-cron').value = s.cron_expr;
+    $('#sched-enabled').checked = !!s.enabled;
+    $('#schedules-form-wrap').classList.remove('hidden');
+    previewSchedule();
+  } catch (e) { toast('编辑失败: ' + e.message, 'error'); }
+}
+async function saveSchedule() {
+  const data = {
+    id:        $('#sched-id').value || undefined,
+    name:      $('#sched-name').value.trim(),
+    cron_expr: $('#sched-cron').value.trim(),
+    enabled:   $('#sched-enabled').checked,
+    trigger_payload: { trigger: 'schedule' },
+  };
+  if (!data.name || !data.cron_expr) {
+    toast('名称和 cron 表达式都要填', 'error');
+    return;
+  }
+  try {
+    const r = await api('/api/schedules/upsert', { method: 'POST', body: data });
+    if (r.ok) {
+      toast('已保存', 'ok');
+      hideScheduleForm();
+      loadSchedules();
+    } else {
+      toast('保存失败: ' + (r.error || '未知'), 'error');
+    }
+  } catch (e) { toast('保存失败: ' + e.message, 'error'); }
+}
+async function deleteSchedule(id) {
+  if (!confirm('确定要删除这个调度吗?')) return;
+  try {
+    await api('/api/schedules/delete', { method: 'POST', body: { id } });
+    toast('已删除', 'ok');
+    loadSchedules();
+  } catch (e) { toast('删除失败: ' + e.message, 'error'); }
+}
+async function toggleSchedule(id, enabled) {
+  // 取得原有数据只改 enabled
+  try {
+    const r = await api('/api/schedules');
+    const s = (r.schedules || []).find(x => x.id === id);
+    if (!s) return;
+    await api('/api/schedules/upsert', { method: 'POST', body: {
+      id: s.id, name: s.name, cron_expr: s.cron_expr,
+      enabled: !!enabled, trigger_payload: s.trigger_payload,
+    }});
+    toast(enabled ? '已启用' : '已禁用', 'ok');
+    loadSchedules();
+  } catch (e) { toast('切换失败: ' + e.message, 'error'); }
+}
+async function fireScheduleNow(id) {
+  try {
+    const r = await api('/api/schedules/fire', { method: 'POST', body: { id } });
+    toast(r.ok ? '已触发: ' + r.message : '失败: ' + r.message, r.ok ? 'ok' : 'error');
+  } catch (e) { toast('触发失败: ' + e.message, 'error'); }
+}
+async function previewSchedule() {
+  const expr = $('#sched-cron').value.trim();
+  if (!expr) return;
+  try {
+    const r = await api('/api/schedules/preview', { method: 'POST', body: { cron_expr: expr } });
+    if (r.ok) {
+      $('#sched-preview').textContent = '下次运行: ' + r.runs.join(' / ');
+    } else {
+      $('#sched-preview').textContent = '❌ ' + r.error;
+    }
+  } catch (e) {
+    $('#sched-preview').textContent = '❌ ' + e.message;
+  }
+}
+
+// =====================================================
+// 集群（多机监控）
+// =====================================================
+let _clusterPeersLocal = [];
+
+async function loadCluster() {
+  try {
+    const r = await api('/api/cluster/peers');
+    // 本机身份
+    if (r.self) {
+      $('#cluster-self-id').value = r.self.id || '';
+      $('#cluster-self-name').value = r.self.name || '';
+      $('#cluster-self-url').value = r.self.url || '';
+    }
+    // Peers
+    _clusterPeersLocal = (r.peers || []).map(p => ({
+      id: p.id || p.name || '',
+      name: p.name || '',
+      url: (p.url || '').replace(/\/+$/, ''),
+    }));
+    renderClusterPeersForm();
+    renderClusterNodes(r.self ? {...r.self.state, id: r.self.id, name: r.self.name, url: r.self.url, _self: true} : null, r.peers || []);
+    $('#cluster-last-refresh').textContent = r.last_refresh || '—';
+  } catch (e) {
+    $('#cluster-nodes').innerHTML = '<div class="text-red-600 text-sm">加载失败: ' + e.message + '</div>';
+  }
+}
+
+function renderClusterPeersForm() {
+  const form = $('#cluster-peers-form');
+  if (_clusterPeersLocal.length === 0) {
+    form.classList.add('hidden');
+    return;
+  }
+  form.classList.remove('hidden');
+  form.innerHTML = _clusterPeersLocal.map((p, i) => `
+    <div class="flex flex-wrap items-center gap-2 p-2 bg-slate-50 rounded border border-slate-200">
+      <input type="text" placeholder="id" value="${escapeHtml(p.id)}" data-idx="${i}" data-k="id"
+        class="border border-slate-300 rounded px-2 py-1 text-sm font-mono w-24">
+      <input type="text" placeholder="name" value="${escapeHtml(p.name)}" data-idx="${i}" data-k="name"
+        class="border border-slate-300 rounded px-2 py-1 text-sm w-32">
+      <input type="text" placeholder="http://100.x.0.12:8765" value="${escapeHtml(p.url)}" data-idx="${i}" data-k="url"
+        class="border border-slate-300 rounded px-2 py-1 text-sm font-mono flex-1 min-w-[200px]">
+      <button onclick="removeClusterPeer(${i})" class="px-2 py-1 rounded bg-red-100 hover:bg-red-200 text-red-700 text-xs">×</button>
+    </div>
+  `).join('');
+}
+
+function addClusterPeer() {
+  _clusterPeersLocal.push({ id: '', name: '', url: '' });
+  renderClusterPeersForm();
+}
+function removeClusterPeer(i) {
+  _clusterPeersLocal.splice(i, 1);
+  renderClusterPeersForm();
+}
+
+async function saveClusterSelf() {
+  try {
+    await api('/api/cluster/self/update', { method: 'POST', body: {
+      id:   $('#cluster-self-id').value,
+      name: $('#cluster-self-name').value,
+      url:  $('#cluster-self-url').value,
+    }});
+    $('#cluster-self-msg').textContent = '已保存 ' + new Date().toLocaleTimeString();
+    loadCluster();
+  } catch (e) {
+    $('#cluster-self-msg').textContent = '❌ ' + e.message;
+  }
+}
+
+async function saveClusterPeers() {
+  // 收集表单里的修改
+  $$('#cluster-peers-form input[data-idx]').forEach(el => {
+    const i = +el.dataset.idx;
+    const k = el.dataset.k;
+    if (_clusterPeersLocal[i]) _clusterPeersLocal[i][k] = el.value.trim();
+  });
+  try {
+    const r = await api('/api/cluster/peers/upsert', { method: 'POST', body: { peers: _clusterPeersLocal } });
+    if (r.ok) {
+      $('#cluster-peers-msg').textContent = '已保存,正在后台拉取状态...';
+      setTimeout(loadCluster, 1500);
+    } else {
+      $('#cluster-peers-msg').textContent = '❌ ' + r.error;
+    }
+  } catch (e) { $('#cluster-peers-msg').textContent = '❌ ' + e.message; }
+}
+
+async function refreshCluster() {
+  try {
+    await api('/api/cluster/refresh', { method: 'POST' });
+    loadCluster();
+  } catch (e) { toast('刷新失败: ' + e.message, 'error'); }
+}
+
+function renderClusterNodes(selfState, peers) {
+  const wrap = $('#cluster-nodes');
+  const cards = [];
+  if (selfState) cards.push(nodeCard(selfState, true));
+  for (const p of peers) cards.push(nodeCard(p, false));
+  wrap.innerHTML = cards.join('') || '<div class="text-center py-6 text-slate-400">还没有 peer，点 + 新增添加</div>';
+}
+
+function nodeCard(p, isSelf) {
+  const st = p.state || {};
+  const q = st.queue || {};
+  const ok = isSelf ? true : p.ok;
+  const borderColor = ok ? 'border-green-300' : 'border-red-300';
+  const dot = ok ? '<span class="inline-block w-2 h-2 rounded-full bg-green-500"></span>' :
+                    '<span class="inline-block w-2 h-2 rounded-full bg-red-500"></span>';
+  const runState = st.run || {};
+  const ff = st.ffmpeg ? st.ffmpeg.split('/').pop() : '—';
+  const fetchedAt = p.fetched_at ? `<div class="text-xs text-slate-400 mt-1">检测于 ${escapeHtml(p.fetched_at)}</div>` : '';
+  const errMsg = p.error ? `<div class="text-xs text-red-600 mt-1">${escapeHtml(p.error)}</div>` : '';
+  return `
+    <div class="bg-white rounded-xl p-4 shadow-sm border ${borderColor}">
+      <div class="flex items-center justify-between mb-2">
+        <div class="flex items-center gap-2">
+          ${dot}
+          <span class="font-semibold">${escapeHtml(p.name || p.id || 'unknown')}</span>
+          ${isSelf ? '<span class="text-xs px-1.5 py-0.5 rounded bg-blue-100 text-blue-700">本机</span>' : ''}
+        </div>
+        <span class="text-xs text-slate-400 font-mono">${escapeHtml(p.id || '')}</span>
+      </div>
+      <div class="text-xs text-slate-500 font-mono mb-2">${escapeHtml(p.url || '')}</div>
+      <div class="grid grid-cols-4 gap-2 text-center text-xs">
+        <div class="bg-slate-50 rounded p-2">
+          <div class="text-slate-400">待处理</div>
+          <div class="text-lg font-semibold text-blue-600">${q.pending ?? '—'}</div>
+        </div>
+        <div class="bg-slate-50 rounded p-2">
+          <div class="text-slate-400">运行中</div>
+          <div class="text-lg font-semibold text-amber-600">${q.running ?? '—'}</div>
+        </div>
+        <div class="bg-slate-50 rounded p-2">
+          <div class="text-slate-400">已完成</div>
+          <div class="text-lg font-semibold text-green-600">${q.done ?? '—'}</div>
+        </div>
+        <div class="bg-slate-50 rounded p-2">
+          <div class="text-slate-400">失败</div>
+          <div class="text-lg font-semibold text-red-600">${q.failed ?? '—'}</div>
+        </div>
+      </div>
+      <div class="mt-3 text-xs text-slate-600 space-y-1">
+        <div>当前文件: <span class="font-mono">${escapeHtml(runState.current_file || '—')}</span></div>
+        <div>ffmpeg: <span class="font-mono">${escapeHtml(ff)}</span></div>
+        ${runState.started_at ? `<div>运行开始: ${escapeHtml(runState.started_at)}</div>` : ''}
+      </div>
+      ${fetchedAt}
+      ${errMsg}
+    </div>
+  `;
+}

@@ -175,6 +175,31 @@ def init_db():
                 updated_at TEXT DEFAULT (datetime('now','localtime'))
             )
         """)
+        # schedules 表（UI 配置的定时调度）
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS schedules (
+                id              TEXT PRIMARY KEY,
+                name            TEXT NOT NULL,
+                cron_expr       TEXT NOT NULL,
+                enabled         INTEGER NOT NULL DEFAULT 1,
+                trigger_payload TEXT NOT NULL DEFAULT '{"trigger":"cron"}',
+                last_run        TEXT,
+                last_status     TEXT,
+                created_at      TEXT DEFAULT (datetime('now','localtime')),
+                updated_at      TEXT
+            )
+        """)
+        # cluster.peers 默认值（多机集群模式下的 peer 列表）
+        cur = conn.execute("SELECT value FROM settings WHERE key='cluster.peers'").fetchone()
+        if not cur:
+            conn.execute(
+                "INSERT INTO settings(key,value) VALUES('cluster.peers','[]')"
+            )
+        # cluster.self.* 默认值（本机在集群里的身份）
+        for k in ['cluster.self.id', 'cluster.self.name', 'cluster.self.url']:
+            cur = conn.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
+            if not cur:
+                conn.execute("INSERT INTO settings(key,value) VALUES(?, '')", (k,))
         # 崩溃恢复:把上轮未结束的 running 重置为 pending
         conn.execute(
             "UPDATE tasks SET status='pending', started_at=NULL "
@@ -1269,6 +1294,26 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/queue/stats":
             return json_response(self, 200, get_queue_stats())
 
+        # ===== schedules GET =====
+        if path == "/api/schedules":
+            return json_response(self, 200, {"schedules": list_schedules()})
+
+        # ===== cluster GET =====
+        if path == "/api/cluster/state":
+            return json_response(self, 200, get_self_state())
+
+        if path == "/api/cluster/peers":
+            return json_response(self, 200, {
+                "self": {
+                    "id": get_self_id(),
+                    "name": get_self_name(),
+                    "url": get_self_url(),
+                    "state": get_self_state(),
+                },
+                "peers": list(_cluster_cache["peers"].values()),
+                "last_refresh": _cluster_cache.get("last_refresh"),
+            })
+
         if path == "/api/cron/status":
             # 检查 ofelia 容器状态
             state = "unknown"
@@ -1369,6 +1414,70 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/cron/restart":
             ok, msg = restart_ofelia()
             return json_response(self, 200, {"ok": ok, "message": msg})
+
+        # ===== schedules POST =====
+        if path == "/api/schedules/upsert":
+            payload = data.get("trigger_payload", {"trigger": "cron"})
+            ok, msg, new_id = upsert_schedule({
+                "id": data.get("id"),
+                "name": (data.get("name") or "").strip(),
+                "cron_expr": (data.get("cron_expr") or "").strip(),
+                "enabled": bool(data.get("enabled", True)),
+                "trigger_payload": payload,
+            })
+            if not ok:
+                return json_response(self, 400, {"ok": False, "error": msg})
+            return json_response(self, 200, {"ok": True, "id": new_id})
+
+        if path == "/api/schedules/delete":
+            sid = data.get("id")
+            if not sid or not delete_schedule(sid):
+                return json_response(self, 404, {"ok": False, "error": "未找到"})
+            return json_response(self, 200, {"ok": True})
+
+        if path == "/api/schedules/fire":
+            sid = data.get("id")
+            if not sid:
+                return json_response(self, 400, {"ok": False, "error": "需要 id"})
+            ok, msg, _ = fire_schedule(sid)
+            return json_response(self, 200, {"ok": ok, "message": msg})
+
+        if path == "/api/schedules/preview":
+            expr = (data.get("cron_expr") or "").strip()
+            try:
+                now = datetime.now()
+                runs = []
+                cur = now - timedelta(minutes=1)
+                for _ in range(3):
+                    cur = _next_run_time(expr, cur)
+                    runs.append(cur.strftime("%Y-%m-%d %H:%M:%S"))
+                return json_response(self, 200, {"ok": True, "runs": runs})
+            except Exception as e:
+                return json_response(self, 400, {"ok": False, "error": str(e)})
+
+        # ===== cluster POST =====
+        if path == "/api/cluster/peers/upsert":
+            peers = data.get("peers", [])
+            if not isinstance(peers, list):
+                return json_response(self, 400, {"ok": False, "error": "peers 必须是数组"})
+            cleaned = update_peers(peers)
+            return json_response(self, 200, {"ok": True, "peers": cleaned})
+
+        if path == "/api/cluster/self/update":
+            update_self(
+                sid=data.get("id"),
+                sname=data.get("name"),
+                surl=data.get("url"),
+            )
+            return json_response(self, 200, {"ok": True, **get_self_state()})
+
+        if path == "/api/cluster/refresh":
+            _cluster_refresh_all()
+            return json_response(self, 200, {
+                "ok": True,
+                "last_refresh": _cluster_cache.get("last_refresh"),
+                "peers": list(_cluster_cache["peers"].values()),
+            })
 
         # ===== 任务队列 POST =====
         if path == "/api/queue/sync":
@@ -1946,10 +2055,344 @@ def update_settings(updates: dict):
         "output_changed": out_changed,
     }
 
+# ============== Scheduler（UI 定时的后台调度器） ==============
+_scheduler_stop = threading.Event()
+
+def _parse_cron_field(field: str, min_v: int, max_v: int) -> set:
+    """解析 cron 单个字段。支持 *, n, n-m, */n, n-m/s, 逗号分隔。"""
+    result = set()
+    for part in field.split(','):
+        step = 1
+        if '/' in part:
+            part, step_str = part.split('/', 1)
+            step = int(step_str)
+        if part == '*' or part == '':
+            start, end = min_v, max_v
+        elif '-' in part:
+            start, end = map(int, part.split('-', 1))
+        else:
+            result.add(int(part))
+            continue
+        for v in range(start, end + 1, step):
+            result.add(v)
+    return result
+
+def _next_run_time(expr: str, after: datetime) -> datetime:
+    """返回 cron expr 在 after 之后的下一次运行时间。"""
+    parts = expr.strip().split()
+    if len(parts) != 5:
+        raise ValueError(f"cron 表达式需要 5 个字段: {expr!r}")
+    mins = _parse_cron_field(parts[0], 0, 59)
+    hrs  = _parse_cron_field(parts[1], 0, 23)
+    doms = _parse_cron_field(parts[2], 1, 31)
+    mons = _parse_cron_field(parts[3], 1, 12)
+    dows = _parse_cron_field(parts[4], 0, 6)
+    cur = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    for _ in range(366 * 24 * 12):  # 最多找一年
+        if cur.month not in mons:
+            cur = (cur.replace(day=1) + timedelta(days=32)).replace(day=1, hour=0, minute=0)
+            continue
+        if cur.day not in doms:
+            cur = (cur + timedelta(days=1)).replace(hour=0, minute=0)
+            continue
+        cron_dow = (cur.weekday() + 1) % 7  # Python: Mon=0 → cron: Sun=0
+        if cron_dow not in dows:
+            cur = (cur + timedelta(days=1)).replace(hour=0, minute=0)
+            continue
+        if cur.hour not in hrs:
+            cur = (cur + timedelta(hours=1)).replace(minute=0)
+            continue
+        if cur.minute not in mins:
+            cur += timedelta(minutes=1)
+            continue
+        return cur
+    raise ValueError(f"找不到下次运行时间: {expr!r}")
+
+def _scheduler_tick():
+    now = datetime.now().replace(second=0, microsecond=0)
+    with db() as conn, _db_lock:
+        schedules = [dict(r) for r in conn.execute(
+            "SELECT * FROM schedules WHERE enabled=1"
+        )]
+    for s in schedules:
+        try:
+            last_run_str = s.get('last_run')
+            if last_run_str:
+                last_run = datetime.fromisoformat(last_run_str)
+                nxt = _next_run_time(s['cron_expr'], last_run)
+            else:
+                # 从未跑过:看过去一小时内有没有应该触发的
+                nxt = _next_run_time(s['cron_expr'], now - timedelta(hours=1))
+            if nxt <= now:
+                payload = json.loads(s.get('trigger_payload') or '{"trigger":"cron"}')
+                trigger = payload.get('trigger', 'cron')
+                ok, msg = start_run(trigger=trigger)
+                status = 'fired' if ok else f'failed: {msg}'
+                with db() as conn, _db_lock:
+                    conn.execute(
+                        "UPDATE schedules SET last_run=?, last_status=? WHERE id=?",
+                        (now_str(), status, s['id'])
+                    )
+                log(f"scheduler fired: id={s['id']} name={s['name']!r} cron={s['cron_expr']!r} -> {msg}")
+        except Exception as e:
+            log(f"scheduler error on id={s.get('id')}: {e}", level=logging.WARNING)
+
+def _scheduler_loop():
+    while not _scheduler_stop.is_set():
+        try:
+            _scheduler_tick()
+        except Exception as e:
+            log(f"scheduler tick error: {e}", level=logging.WARNING)
+        _scheduler_stop.wait(30)  # 每 30 秒检查一次
+
+def start_scheduler():
+    """启动后台调度线程（只启动一次）"""
+    global _scheduler_thread
+    if _scheduler_thread and _scheduler_thread.is_alive():
+        return
+    _scheduler_stop.clear()
+    _scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True, name="scheduler")
+    _scheduler_thread.start()
+    log("scheduler thread started")
+
+def list_schedules():
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM schedules ORDER BY created_at DESC").fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        # 计算下次运行
+        try:
+            last = datetime.fromisoformat(d['last_run']) if d.get('last_run') else None
+            anchor = last or (datetime.now() - timedelta(days=1))
+            d['next_run'] = _next_run_time(d['cron_expr'], anchor).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            d['next_run'] = None
+        out.append(d)
+    return out
+
+def upsert_schedule(s: dict):
+    """创建或更新。s 里有 id 则更新,否则新建。"""
+    import uuid
+    s = dict(s)
+    s['id'] = s.get('id') or f"sch-{uuid.uuid4().hex[:8]}"
+    enabled = 1 if s.get('enabled', True) else 0
+    trigger_payload = s.get('trigger_payload') or '{"trigger":"cron"}'
+    if isinstance(trigger_payload, dict):
+        trigger_payload = json.dumps(trigger_payload)
+    # 验证 cron
+    try:
+        _next_run_time(s['cron_expr'], datetime.now())
+    except Exception as e:
+        return False, f"cron 表达式无效: {e}", None
+    with db() as conn, _db_lock:
+        existing = conn.execute("SELECT id FROM schedules WHERE id=?", (s['id'],)).fetchone()
+        if existing:
+            conn.execute("""
+                UPDATE schedules SET name=?, cron_expr=?, enabled=?, trigger_payload=?, updated_at=?
+                WHERE id=?
+            """, (s['name'], s['cron_expr'], enabled, trigger_payload, now_str(), s['id']))
+        else:
+            conn.execute("""
+                INSERT INTO schedules(id, name, cron_expr, enabled, trigger_payload, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?)
+            """, (s['id'], s['name'], s['cron_expr'], enabled, trigger_payload, now_str()))
+    return True, "OK", s['id']
+
+def delete_schedule(sid: str):
+    with db() as conn, _db_lock:
+        n = conn.execute("DELETE FROM schedules WHERE id=?", (sid,)).rowcount
+    return n > 0
+
+def fire_schedule(sid: str):
+    with db() as conn:
+        s = conn.execute("SELECT * FROM schedules WHERE id=?", (sid,)).fetchone()
+    if not s:
+        return False, "schedule 不存在", None
+    s = dict(s)
+    payload = json.loads(s.get('trigger_payload') or '{}')
+    trigger = payload.get('trigger', 'cron')
+    ok, msg = start_run(trigger=trigger)
+    with db() as conn, _db_lock:
+        conn.execute("UPDATE schedules SET last_run=?, last_status=? WHERE id=?",
+                     (now_str(), 'fired' if ok else f'failed: {msg}', sid))
+    return ok, msg, sid
+
+# ============== Cluster（多机集群模式） ==============
+import urllib.request as _urlreq
+import urllib.error as _urlerr
+import socket as _socket
+
+_cluster_cache = {"peers": {}, "last_refresh": 0}
+_cluster_stop = threading.Event()
+_scheduler_thread = None
+_cluster_thread = None
+
+def _get_setting(key: str, default: str = "") -> str:
+    with db() as conn:
+        r = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return r["value"] if r else default
+
+def _set_setting(key: str, value: str):
+    with db() as conn, _db_lock:
+        conn.execute(
+            "INSERT INTO settings(key,value,updated_at) VALUES(?,?,datetime('now','localtime')) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (key, value)
+        )
+
+def _detect_tailscale_ip() -> str:
+    try:
+        r = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=3)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip().split()[0]
+    except Exception:
+        pass
+    return ""
+
+def get_self_id() -> str:
+    sid = _get_setting("cluster.self.id")
+    if sid:
+        return sid
+    return _socket.gethostname()
+
+def get_self_name() -> str:
+    return _get_setting("cluster.self.name") or _socket.gethostname()
+
+def get_self_url() -> str:
+    cached = _get_setting("cluster.self.url")
+    if cached:
+        return cached
+    ip = _detect_tailscale_ip()
+    if ip:
+        return f"http://{ip}:{PORT}"
+    return f"http://{_socket.gethostname()}:{PORT}"
+
+def get_self_state() -> dict:
+    state = get_state()
+    q = get_queue_stats()
+    ff, ver = ffmpeg_version()
+    try:
+        disk = disk_usage()
+    except Exception:
+        disk = {}
+    return {
+        "id": get_self_id(),
+        "name": get_self_name(),
+        "hostname": _socket.gethostname(),
+        "url": get_self_url(),
+        "alive": True,
+        "ffmpeg": ff,
+        "ffmpeg_version": ver,
+        "queue": q,
+        "run": state,
+        "disk": disk,
+        "now": now_str(),
+    }
+
+def _fetch_peer(url: str, timeout: float = 5.0):
+    """GET {url}/api/cluster/state, returns dict or raises."""
+    full = url.rstrip("/") + "/api/cluster/state"
+    req = _urlreq.Request(full, headers={"User-Agent": "video-manager-cluster/1.0"})
+    with _urlreq.urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode("utf-8")
+        return json.loads(body)
+
+def _cluster_refresh_one(peer: dict) -> dict:
+    """拉取单个 peer 的状态，结果存到 _cluster_cache"""
+    pid = peer.get("id") or peer.get("url")
+    try:
+        st = _fetch_peer(peer["url"], timeout=4.0)
+        _cluster_cache["peers"][pid] = {
+            "id": peer.get("id") or st.get("id"),
+            "name": peer.get("name") or st.get("name"),
+            "url": peer["url"],
+            "ok": True,
+            "state": st,
+            "fetched_at": now_str(),
+            "latency_ms": None,
+        }
+    except Exception as e:
+        _cluster_cache["peers"][pid] = {
+            "id": peer.get("id"),
+            "name": peer.get("name"),
+            "url": peer["url"],
+            "ok": False,
+            "error": str(e),
+            "fetched_at": now_str(),
+        }
+    return _cluster_cache["peers"][pid]
+
+def _cluster_loop():
+    while not _cluster_stop.is_set():
+        try:
+            _cluster_refresh_all()
+        except Exception as e:
+            log(f"cluster loop error: {e}", level=logging.WARNING)
+        _cluster_stop.wait(30)
+
+def _cluster_refresh_all():
+    raw = _get_setting("cluster.peers", "[]")
+    try:
+        peers = json.loads(raw) if raw else []
+    except Exception:
+        peers = []
+    # 清理已删除的 peer(避免 cache 里堆积幽灵)
+    valid_ids = {p.get("id") or p.get("url") for p in peers}
+    for cached_id in list(_cluster_cache["peers"].keys()):
+        if cached_id not in valid_ids:
+            del _cluster_cache["peers"][cached_id]
+    for p in peers:
+        if not p.get("url"):
+            continue
+        try:
+            _cluster_refresh_one(p)
+        except Exception as e:
+            log(f"cluster refresh {p.get('url')}: {e}", level=logging.WARNING)
+    _cluster_cache["last_refresh"] = now_str()
+
+def start_cluster():
+    global _cluster_thread
+    if _cluster_thread and _cluster_thread.is_alive():
+        return
+    _cluster_stop.clear()
+    _cluster_thread = threading.Thread(target=_cluster_loop, daemon=True, name="cluster-heartbeat")
+    _cluster_thread.start()
+    log("cluster heartbeat thread started")
+
+def update_peers(peers_list: list):
+    """peers_list: [{"id":..,"name":..,"url":..}]"""
+    # 校验每条
+    cleaned = []
+    for p in peers_list:
+        if not isinstance(p, dict):
+            continue
+        url = (p.get("url") or "").strip().rstrip("/")
+        if not url:
+            continue
+        if not url.startswith("http://") and not url.startswith("https://"):
+            continue
+        pid = (p.get("id") or p.get("name") or url).strip()
+        cleaned.append({"id": pid, "name": (p.get("name") or pid).strip(), "url": url})
+    _set_setting("cluster.peers", json.dumps(cleaned))
+    # 立即刷新一次
+    _cluster_refresh_all()
+    return cleaned
+
+def update_self(sid: str = None, sname: str = None, surl: str = None):
+    if sid is not None:
+        _set_setting("cluster.self.id", sid.strip())
+    if sname is not None:
+        _set_setting("cluster.self.name", sname.strip())
+    if surl is not None:
+        _set_setting("cluster.self.url", surl.strip())
+
 # ============== main ==============
 def main():
     init_db()
     load_settings()
+    start_scheduler()
+    start_cluster()
     log(f"启动: 监听 {HOST}:{PORT}")
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     try:
