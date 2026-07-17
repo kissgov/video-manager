@@ -1559,12 +1559,24 @@ function peerFilesCard(p, isSelf, dir) {
 
 // ============== 视频播放器 ==============
 function playVideo(streamUrl, title, info) {
+  console.log('[video] playVideo', { streamUrl, title, info });
   $('#video-modal-title').textContent = title;
   $('#video-modal-info').textContent = info || '';
   $('#video-modal-download').href = streamUrl.replace('/stream?', '/download?');
   const player = $('#video-modal-player');
+  // 重置 src 再设 (避免 Chrome 状态混乱)
+  player.removeAttribute('src');
+  player.load();
   player.src = streamUrl;
   player.load();
+  // 事件: 准备就绪 / 错误
+  player.onloadedmetadata = () => console.log('[video] metadata loaded', player.duration, player.videoWidth, player.videoHeight);
+  player.onerror = (e) => {
+    const err = player.error;
+    console.error('[video] error', err ? `code=${err.code} msg=${err.message}` : 'unknown', e);
+    toast('视频播放失败: code=' + (err ? err.code : '?') + ', 详见浏览器控制台', 'error');
+  };
+  player.oncanplay = () => console.log('[video] can play');
   $('#video-modal').classList.remove('hidden');
 }
 function closeVideoModal() {

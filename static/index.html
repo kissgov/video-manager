@@ -598,7 +598,9 @@
           </div>
         </div>
         <div class="flex-1 flex items-center justify-center bg-black" style="min-height: 200px;">
-          <video id="video-modal-player" controls autoplay class="max-w-full max-h-full" style="max-height: calc(92vh - 100px);"></video>
+          <video id="video-modal-player" controls autoplay playsinline preload="metadata" class="max-w-full max-h-full" style="width: 100%; max-height: calc(92vh - 100px); background: #000;">
+            浏览器不支持 video 标签
+          </video>
         </div>
         <div id="video-modal-info" class="p-2 text-xs text-slate-400 border-t border-slate-700"></div>
       </div>

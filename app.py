@@ -1126,6 +1126,10 @@ def ffmpeg_version():
 
 # ============== HTTP 路由 ==============
 class Handler(BaseHTTPRequestHandler):
+    # 升级到 HTTP/1.1:浏览器视频流(尤其是 Range seek)需要 keep-alive + chunked
+    protocol_version = "HTTP/1.1"
+    # 禁掉默认 keep-alive 的 5s 超时(socket 默认),改成系统级
+    # (ThreadingHTTPServer 会处理)
     def log_message(self, fmt, *args):
         # 静默访问日志(我们自己 log)
         pass
@@ -1196,9 +1200,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(length))
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Range")
+        self.send_header("Access-Control-Expose-Headers", "Content-Range, Accept-Ranges, Content-Length")
         if status == 206:
             self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
         self.end_headers()
