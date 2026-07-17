@@ -1258,6 +1258,69 @@ class Handler(BaseHTTPRequestHandler):
             pass
         return None
 
+    def _proxy_peer_stream(self, qs, as_attachment: bool):
+        """从配置的远端 peer 拉文件,转给客户端。处理 HTTPS Mixed Content。
+        qs: ?peer=ID&dir=input|output&path=xxx
+        as_attachment: True=下载,False=流播放
+        """
+        peer_id = qs.get("peer", [""])[0]
+        dir_param = qs.get("dir", ["output"])[0]
+        file_param = qs.get("path", [""])[0]
+        if not peer_id or not file_param:
+            return json_response(self, 400, {"ok": False, "error": "需要 peer 和 path 参数"})
+        # 查 peer URL
+        try:
+            raw = _get_setting("cluster.peers", "[]")
+            peers = json.loads(raw) if raw else []
+        except Exception:
+            peers = []
+        peer = next((p for p in peers if p.get("id") == peer_id), None)
+        if not peer:
+            return json_response(self, 404, {"ok": False, "error": f"peer {peer_id!r} 不存在"})
+        target_url = f"{peer['url'].rstrip('/')}/api/files/stream?dir={dir_param}&path={_urlquote(file_param)}"
+        # 转发 Range
+        range_header = self.headers.get("Range")
+        headers = {"User-Agent": "video-manager-proxy/1.0"}
+        if range_header:
+            headers["Range"] = range_header
+        req = _urlreq.Request(target_url, headers=headers)
+        try:
+            upstream = _urlreq.urlopen(req, timeout=30)
+        except Exception as e:
+            return json_response(self, 502, {"ok": False, "error": f"上游 peer 不可达: {e}"})
+        # 透传上游响应头 + 状态码(200/206)
+        status = upstream.status
+        # 透传关键头
+        passthrough = {
+            "Content-Type", "Content-Length", "Content-Range",
+            "Accept-Ranges", "Cache-Control",
+        }
+        self.send_response(status)
+        for h, v in upstream.getheaders():
+            if h in passthrough:
+                self.send_header(h, v)
+        # 覆盖 CORS / Connection
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Expose-Headers", "Content-Range, Accept-Ranges, Content-Length")
+        self.send_header("Connection", "keep-alive")
+        if as_attachment:
+            name = Path(file_param).name
+            self.send_header("Content-Disposition",
+                             f"attachment; filename*=UTF-8''{_urlquote(name)}")
+        self.end_headers()
+        # 流式透传 body
+        try:
+            while True:
+                chunk = upstream.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            log(f"proxy stream error: {e}", level=logging.WARNING)
+        return None
+
     def do_OPTIONS(self):
         # 处理 CORS preflight
         self.send_response(204)
@@ -1480,6 +1543,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/cluster/files":
             return json_response(self, 200,
                 _cluster_aggregate_files(qs.get("dir", ["output"])[0]))
+
+        # ---- 代理:透过本节点转播远端 peer 的视频流(处理 HTTPS Mixed Content)----
+        if path == "/api/cluster/stream":
+            return self._proxy_peer_stream(qs, as_attachment=False)
+
+        if path == "/api/cluster/download":
+            return self._proxy_peer_stream(qs, as_attachment=True)
 
         if path == "/api/cron/status":
             # 检查 ofelia 容器状态

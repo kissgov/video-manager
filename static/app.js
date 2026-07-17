@@ -1514,8 +1514,14 @@ function peerFilesCard(p, isSelf, dir) {
   }
   const f = p.files || { items: [], count: 0, total_size: 0, total_size_h: '0 B' };
   const rows = (f.items || []).map(it => {
-    const streamUrl = `${p.url}/api/files/stream?dir=${dir}&path=${encodeURIComponent(it.path)}`;
-    const dlUrl     = `${p.url}/api/files/download?dir=${dir}&path=${encodeURIComponent(it.path)}`;
+    // self 用相对 URL (跟随当前 origin,HTTPS/Cloudflare 都能用)
+    // peer 用代理端点 (同源,避免 Mixed Content)
+    const streamUrl = isSelf
+      ? `/api/files/stream?dir=${dir}&path=${encodeURIComponent(it.path)}`
+      : `/api/cluster/stream?peer=${encodeURIComponent(p.id)}&dir=${dir}&path=${encodeURIComponent(it.path)}`;
+    const dlUrl     = isSelf
+      ? `/api/files/download?dir=${dir}&path=${encodeURIComponent(it.path)}`
+      : `/api/cluster/download?peer=${encodeURIComponent(p.id)}&dir=${dir}&path=${encodeURIComponent(it.path)}`;
     const localDelete = isSelf;
     return `
       <tr class="border-b border-slate-100 hover:bg-slate-50">
@@ -1562,6 +1568,7 @@ function playVideo(streamUrl, title, info) {
   console.log('[video] playVideo', { streamUrl, title, info });
   $('#video-modal-title').textContent = title;
   $('#video-modal-info').textContent = info || '';
+  // 下载 URL 替换 stream -> download(本机/代理都适用)
   $('#video-modal-download').href = streamUrl.replace('/stream?', '/download?');
   const player = $('#video-modal-player');
   // 重置 src 再设 (避免 Chrome 状态混乱)
