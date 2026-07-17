@@ -323,6 +323,47 @@
 
   <!-- Config -->
   <section data-panel="config" class="hidden space-y-4">
+    <!-- 路径设置（热加载、不需重启服务） -->
+    <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-200">
+      <div class="flex items-center justify-between mb-4">
+        <div>
+          <h3 class="font-semibold">路径设置</h3>
+          <p class="text-xs text-slate-500 mt-1">输入 / 输出目录，保存后立即生效，无需重启服务。存在 SQLite <code>settings</code> 表。</p>
+        </div>
+        <button onclick="loadSettings()" class="text-xs px-3 py-1.5 rounded bg-slate-100 hover:bg-slate-200">重新读取</button>
+        <button onclick="restartService()" id="btn-restart-service" class="ml-2 text-xs px-3 py-1.5 rounded bg-amber-100 hover:bg-amber-200 text-amber-800" title="重启 video-manager 服务（需 sudoers 配置）">重启服务</button>
+      </div>
+      <form id="settings-form" class="grid grid-cols-1 gap-4" onsubmit="return false">
+        <div class="flex flex-col">
+          <label class="block text-xs font-medium text-slate-600 mb-1">
+            输入目录
+            <span class="ml-1 px-1 text-xs rounded bg-green-100 text-green-700">热加载</span>
+            <span class="text-slate-400 ml-1" id="settings-input-info">—</span>
+          </label>
+          <input type="text" name="input_dir" id="settings-input-dir" autocomplete="off" spellcheck="false"
+            class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
+            placeholder="/volume1/Videos/.../camera_dir">
+        </div>
+        <div class="flex flex-col">
+          <label class="block text-xs font-medium text-slate-600 mb-1">
+            输出目录
+            <span class="ml-1 px-1 text-xs rounded bg-green-100 text-green-700">热加载</span>
+            <span class="text-slate-400 ml-1" id="settings-output-info">—</span>
+          </label>
+          <input type="text" name="output_dir" id="settings-output-dir" autocomplete="off" spellcheck="false"
+            class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
+            placeholder="/volume1/Videos/.../compressed">
+        </div>
+      </form>
+      <div id="settings-warn" class="hidden mt-4 p-3 bg-amber-50 border border-amber-200 rounded-md text-sm text-amber-800"></div>
+      <div class="mt-4 flex items-center gap-3">
+        <button onclick="saveSettings()" class="px-5 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium">保存</button>
+        <button onclick="resetSettingsToDefault()" class="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-sm">恢复默认</button>
+        <span id="settings-msg" class="text-sm"></span>
+      </div>
+    </div>
+
+    <!-- 脚本参数（原样保留） -->
     <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-200">
       <div class="flex items-center justify-between mb-4">
         <div>

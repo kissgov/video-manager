@@ -22,20 +22,23 @@ from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 
 # ============== 配置 ==============
-APP_DIR        = Path("/volume1/scripts/video-manager")
+APP_DIR        = Path("/home/kxrdyf/scripts/video-manager")
 DATA_DIR       = APP_DIR / "data"
 LOG_DIR        = APP_DIR / "logs"
 STATIC_DIR     = APP_DIR / "static"
 DB_PATH        = DATA_DIR / "history.db"
 APP_LOG_PATH   = LOG_DIR / "app.log"
 
-SCRIPT_PATH    = Path("/volume1/scripts/compress_video.sh")
-SCRIPT_LOG     = Path("/volume1/scripts/compress.log")
-SCRIPT_LOCK    = Path("/volume1/scripts/compress.lock")
-OFELIA_INI     = Path("/volume1/docker/ffmpeg/ofelia.ini")
-OFELIA_BAK     = Path("/volume1/docker/ffmpeg/ofelia.ini.bak")
-INPUT_DIR      = Path("/input")
-OUTPUT_DIR     = Path("/output")
+SCRIPT_PATH    = Path("/home/kxrdyf/scripts/compress_video.sh")
+SCRIPT_LOG     = Path("/home/kxrdyf/scripts/compress.log")
+SCRIPT_LOCK    = Path("/home/kxrdyf/scripts/compress.lock")
+OFELIA_INI     = Path("/home/kxrdyf/docker/ffmpeg/ofelia.ini")
+OFELIA_BAK     = Path("/home/kxrdyf/docker/ffmpeg/ofelia.ini.bak")
+# 默认值（仅 DB 无记录时使用；首次启动会落库，之后可在 UI 配置页修改）
+_INPUT_DIR_DEFAULT  = Path("/volume1/Videos/XiaomiCamera_00_B888809C1E93")
+_OUTPUT_DIR_DEFAULT = Path("/volume1/Videos/compressed")
+INPUT_DIR  = _INPUT_DIR_DEFAULT
+OUTPUT_DIR = _OUTPUT_DIR_DEFAULT
 
 HOST           = "0.0.0.0"
 PORT           = 8765
@@ -47,7 +50,7 @@ def now_str():
 # ============== Logging ==============
 # 三路 handler:
 #   1. logs/app.log  — 全量详细(level/timestamp/module/lineno) + size 轮转
-#   2. /volume1/scripts/compress.log — 紧凑 bash 兼容格式(给 UI 读) + size 轮转
+#   2. /home/kxrdyf/scripts/compress.log — 紧凑 bash 兼容格式(给 UI 读) + size 轮转
 #   3. stdout        — 紧凑格式(nohup 重定向到 logs/stdout.log)
 LOG_LEVEL_FILE     = logging.DEBUG
 LOG_LEVEL_COMPACT  = logging.INFO
@@ -164,6 +167,14 @@ def init_db():
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
         if "output_size" not in cols:
             conn.execute("ALTER TABLE tasks ADD COLUMN output_size INTEGER")
+        # settings 表（路径等运行时可改配置）
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key        TEXT PRIMARY KEY,
+                value      TEXT NOT NULL,
+                updated_at TEXT DEFAULT (datetime('now','localtime'))
+            )
+        """)
         # 崩溃恢复:把上轮未结束的 running 重置为 pending
         conn.execute(
             "UPDATE tasks SET status='pending', started_at=NULL "
@@ -394,7 +405,7 @@ _NICE_LEVEL     = 10
 _MIN_FILE_SIZE  = 1_048_576  # 1MB,小于视为损坏
 _MAX_LOG_LINES  = 2000
 
-_LOCK_FILE      = Path("/scripts/compress.lock")
+_LOCK_FILE      = Path("/home/kxrdyf/scripts/compress.lock")
 _SCRIPT_LOG     = Path("/scripts/compress.log")
 
 _worker_thread  = None      # Thread 对象
@@ -504,10 +515,16 @@ def _build_ffmpeg_cmd(input_file: Path, output_file: Path, hwaccel: str, ffmpeg_
             ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error",
             "-err_detect", "ignore_err", "-fflags", "+discardcorrupt"]
     if hwaccel == "rkmpp":
+        # RKMPP 优化管线:硬件解码(drm_prime 零拷贝) → RGA 硬缩 → MPP 硬编
+        # 实测 RK3588: 12x+ 实时（软缩放只能 2x）
+        # 只设 vpp_rkrga 缩放,framerate 不强制(source 通常 20fps,压缩比够好)
+        # 加 format/fps 会造成 auto_scale_0 格式不兼容
         return base + [
+            "-hwaccel", "rkmpp",
+            "-hwaccel_output_format", "drm_prime",
             "-i", str(input_file),
-            "-vf", f"scale=-2:{_OUTPUT_HEIGHT},fps={_OUTPUT_FPS}",
-            "-c:v", "h264_rkmpp", "-qp", str(_VAAPI_QP), "-rc_mode", "2",
+            "-vf", f"vpp_rkrga=w=-2:h={_OUTPUT_HEIGHT}",
+            "-c:v", "h264_rkmpp", "-b:v", "2M",
             "-an", "-movflags", "+faststart", "-y", str(output_file),
         ]
     if hwaccel == "vaapi":
@@ -1195,6 +1212,16 @@ class Handler(BaseHTTPRequestHandler):
             cfg, _ = read_script_config()
             return json_response(self, 200, {"config": cfg, "keys": CONFIG_KEYS})
 
+        if path == "/api/settings":
+            return json_response(self, 200, {
+                "input_dir":  str(INPUT_DIR),
+                "output_dir": str(OUTPUT_DIR),
+                "defaults":   {
+                    "input_dir":  str(_INPUT_DIR_DEFAULT),
+                    "output_dir": str(_OUTPUT_DIR_DEFAULT),
+                },
+            })
+
         if path == "/api/cron":
             jobs = read_ofelia_jobs()
             for j in jobs:
@@ -1287,6 +1314,49 @@ class Handler(BaseHTTPRequestHandler):
             ok = update_script_config(data.get("config", {}))
             cfg, _ = read_script_config()
             return json_response(self, 200, {"ok": ok, "config": cfg})
+
+        if path == "/api/settings":
+            ok, msg, result = update_settings(data)
+            if not ok:
+                return json_response(self, 400, {"ok": False, "error": msg})
+            return json_response(self, 200, {"ok": True, "msg": msg, **result})
+
+        if path == "/api/service/restart":
+            # 重启当前 video-manager 服务本身。
+            # 需要 kxrdyf 能 NOPASSWD 跑 systemctl restart video-manager。
+            # 顺序: 先把响应 flush 给客户端 -> 后台线程 sleep 一下 -> Popen systemctl
+            #       (systemd 会 SIGTERM 当前进程，但客户端已经拿到 200)
+            payload = json.dumps({"ok": True, "msg": "重启指令已发送，服务约 1-3 秒后恢复"}).encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(payload)
+                self.wfile.flush()
+            except Exception as e:
+                log(f"重启响应 flush 失败: {e}", level=logging.WARNING)
+                return
+
+            def _trigger():
+                time.sleep(0.2)  # 客户端先拿到响应
+                try:
+                    p = subprocess.Popen(
+                        ["sudo", "-n", "/usr/bin/systemctl", "restart", "video-manager"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                    )
+                    _, err = p.communicate(timeout=15)
+                    if p.returncode != 0:
+                        log(f"systemctl restart 失败 (rc={p.returncode}): {err.decode(errors='replace')}",
+                            level=logging.ERROR)
+                except subprocess.TimeoutExpired:
+                    log("systemctl restart 超时", level=logging.ERROR)
+                except Exception as e:
+                    log(f"重启服务异常: {e}", level=logging.ERROR)
+            threading.Thread(target=_trigger, daemon=True).start()
+            return  # 不再走下面的 404 分支
 
         if path == "/api/cron":
             jobs = data.get("jobs", [])
@@ -1754,9 +1824,132 @@ def get_history(limit=20):
         ).fetchall()
         return [dict(r) for r in rows]
 
+# ============== Settings（路径配置，热加载） ==============
+_settings_lock = threading.Lock()
+
+def _settings_table():
+    """确保 settings 表存在。"""
+    with db() as conn, _db_lock:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key        TEXT PRIMARY KEY,
+                value      TEXT NOT NULL,
+                updated_at TEXT DEFAULT (datetime('now','localtime'))
+            )
+        """)
+    return conn
+
+def _read_setting(key: str, default: Path) -> Path:
+    try:
+        with _settings_table() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            if row and row["value"]:
+                p = Path(row["value"])
+                if p.is_absolute():
+                    return p
+    except Exception as e:
+        log(f"读 settings[{key}] 失败: {e}", level=logging.WARNING)
+    return default
+
+def load_settings():
+    """启动时调用:从 DB 加载 INPUT_DIR/OUTPUT_DIR;首次运行把默认值落库。"""
+    global INPUT_DIR, OUTPUT_DIR
+    with _settings_lock:
+        INPUT_DIR  = _read_setting("input_dir",  _INPUT_DIR_DEFAULT)
+        OUTPUT_DIR = _read_setting("output_dir", _OUTPUT_DIR_DEFAULT)
+        try:
+            with _settings_table() as conn:
+                conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+                             ("input_dir", str(INPUT_DIR)))
+                conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+                             ("output_dir", str(OUTPUT_DIR)))
+        except Exception as e:
+            log(f"settings 默认值写库失败: {e}", level=logging.WARNING)
+    log(f"加载路径: input={INPUT_DIR}  output={OUTPUT_DIR}")
+
+# 禁止选择的路径前缀（系统 / 挂载点目录，容易误选）
+_BAD_PATH_PREFIXES = (
+    "/proc", "/sys", "/dev", "/run", "/boot", "/etc", "/var", "/usr",
+    "/lib", "/lib64", "/bin", "/sbin", "/opt", "/srv", "/mnt", "/media",
+    "/tmp", "/root", "/home",
+    str(APP_DIR),                  # 不能把输出指到 app 自身目录里
+)
+
+def _validate_path(p_str: str, *, must_be_writable=False, must_be_readable=True, allow_create=True):
+    """返回 (ok, msg, resolved|None)。"""
+    if not p_str or not str(p_str).strip():
+        return False, "路径不能为空", None
+    raw = str(p_str).strip()
+    if not raw.startswith("/"):
+        return False, "必须使用绝对路径（以 / 开头）", None
+    try:
+        resolved = Path(raw).expanduser().resolve()
+    except Exception as e:
+        return False, f"路径解析失败: {e}", None
+    resolved_s = str(resolved)
+    for bp in _BAD_PATH_PREFIXES:
+        if resolved_s == bp or resolved_s.startswith(bp.rstrip("/") + "/"):
+            return False, f"禁止使用 {bp} 下的路径", None
+    if not resolved.exists():
+        if not allow_create:
+            return False, f"目录不存在: {resolved}", None
+        try:
+            resolved.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            return False, f"目录不存在且无权限创建: {resolved}", None
+        except Exception as e:
+            return False, f"目录不存在且无法创建: {e}", None
+    if not resolved.is_dir():
+        return False, f"不是目录: {resolved}", None
+    if must_be_readable and not os.access(resolved, os.R_OK):
+        return False, f"目录不可读: {resolved}", None
+    if must_be_writable and not os.access(resolved, os.W_OK):
+        return False, f"目录不可写: {resolved}", None
+    return True, "OK", resolved
+
+def update_settings(updates: dict):
+    """更新路径设置。返回 (ok, msg, dict|None)。"""
+    global INPUT_DIR, OUTPUT_DIR
+    new_in_raw  = str(updates.get("input_dir",  str(INPUT_DIR))).strip()
+    new_out_raw = str(updates.get("output_dir", str(OUTPUT_DIR))).strip()
+    ok1, m1, p1 = _validate_path(new_in_raw,  must_be_writable=False, must_be_readable=True)
+    if not ok1:
+        return False, f"input_dir: {m1}", None
+    ok2, m2, p2 = _validate_path(new_out_raw, must_be_writable=True,  must_be_readable=True)
+    if not ok2:
+        return False, f"output_dir: {m2}", None
+    if p1 == p2:
+        return False, "输入和输出不能是同一目录", None
+    in_changed  = p1 != INPUT_DIR
+    out_changed = p2 != OUTPUT_DIR
+    with _settings_lock:
+        with _settings_table() as conn:
+            for k, v in [("input_dir", str(p1)), ("output_dir", str(p2))]:
+                conn.execute(
+                    "INSERT INTO settings(key,value,updated_at) VALUES(?,?,datetime('now','localtime')) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                    (k, v)
+                )
+        INPUT_DIR  = p1
+        OUTPUT_DIR = p2
+    log(f"路径设置更新: input={INPUT_DIR}  output={OUTPUT_DIR}")
+    # 自动重新扫描新输入目录
+    try:
+        sync_tasks_from_input()
+        log("已重新扫描输入目录,新文件加入队列")
+    except Exception as e:
+        log(f"sync_tasks_from_input 失败: {e}", level=logging.WARNING)
+    return True, "OK", {
+        "input_dir":     str(INPUT_DIR),
+        "output_dir":    str(OUTPUT_DIR),
+        "input_changed": in_changed,
+        "output_changed": out_changed,
+    }
+
 # ============== main ==============
 def main():
     init_db()
+    load_settings()
     log(f"启动: 监听 {HOST}:{PORT}")
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     try:

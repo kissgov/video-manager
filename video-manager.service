@@ -6,17 +6,18 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=kxrdyf
-WorkingDirectory=/volume1/scripts/video-manager
-ExecStart=/usr/bin/python3 /volume1/scripts/video-manager/app.py
+WorkingDirectory=/home/kxrdyf/scripts/video-manager
+ExecStart=/usr/bin/python3 /home/kxrdyf/scripts/video-manager/app.py
 Restart=on-failure
 RestartSec=5
-StandardOutput=append:/volume1/scripts/video-manager/logs/stdout.log
-StandardError=append:/volume1/scripts/video-manager/logs/stderr.log
+StandardOutput=append:/home/kxrdyf/scripts/video-manager/logs/stdout.log
+StandardError=append:/home/kxrdyf/scripts/video-manager/logs/stderr.log
 
 # 安全加固(适度)
 NoNewPrivileges=true
 ProtectSystem=full
-ProtectHome=read-only
+# 这台 NAS volume1 挂在 /home 下,data/logs 都要写到这里,不能 read-only
+ProtectHome=false
 
 [Install]
 WantedBy=multi-user.target

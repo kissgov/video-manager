@@ -1,0 +1,14 @@
+# Allow kxrdyf to restart / check the video-manager systemd service without password.
+# Required by the "重启服务" button in the Web UI config page.
+#
+# Install:
+#   sudo cp contrib/video-manager-restart.sudoers /etc/sudoers.d/video-manager-restart
+#   sudo chmod 0440 /etc/sudoers.d/video-manager-restart
+#   sudo visudo -c -f /etc/sudoers.d/video-manager-restart
+#
+# Remove:
+#   sudo rm /etc/sudoers.d/video-manager-restart
+
+kxrdyf ALL=(root) NOPASSWD: /usr/bin/systemctl restart video-manager
+kxrdyf ALL=(root) NOPASSWD: /usr/bin/systemctl status video-manager
+kxrdyf ALL=(root) NOPASSWD: /usr/bin/systemctl is-active video-manager

@@ -59,7 +59,7 @@ function showTab(name) {
   if (name === 'run')      loadRun();
   if (name === 'logs')     loadLogs();
   if (name === 'files')    loadFiles();
-  if (name === 'config')   loadConfig();
+  if (name === 'config') { loadConfig(); loadSettings(); }
   if (name === 'cron')     loadCron();
   if (name === 'system')   loadSystem();
   if (name === 'queue')    loadQueue();
@@ -477,6 +477,103 @@ function renderFiles(which, r) {
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// ---- 路径设置（热加载） ----
+async function loadSettings() {
+  try {
+    const r = await api('/api/settings');
+    $('#settings-input-dir').value  = r.input_dir  || '';
+    $('#settings-output-dir').value = r.output_dir || '';
+    $('#settings-input-info').textContent  = r.input_dir  || '—';
+    $('#settings-output-info').textContent = r.output_dir || '—';
+    $('#settings-msg').textContent = '';
+    $('#settings-warn').classList.add('hidden');
+    // 顺便拉一下磁盘占用展示在输入框下面
+    try {
+      const d = await api('/api/disk');
+      const inUse  = d.input  && d.input.percent  != null ? `${d.input.used_h} / ${d.input.total_h} (${d.input.percent}%)` : '—';
+      const outUse = d.output && d.output.percent != null ? `${d.output.used_h} / ${d.output.total_h} (${d.output.percent}%)` : '—';
+      $('#settings-input-info').textContent  = `${r.input_dir} · ${inUse}`;
+      $('#settings-output-info').textContent = `${r.output_dir} · ${outUse}`;
+    } catch (_) {}
+  } catch (e) {
+    toast('读取路径设置失败: ' + e.message, 'error');
+  }
+}
+
+async function saveSettings() {
+  const inDir  = $('#settings-input-dir').value.trim();
+  const outDir = $('#settings-output-dir').value.trim();
+  if (!inDir || !outDir) {
+    $('#settings-msg').textContent = '两个路径都得填';
+    $('#settings-msg').className = 'text-sm text-red-600';
+    return;
+  }
+  $('#settings-msg').textContent = '保存中...';
+  $('#settings-msg').className = 'text-sm text-slate-500';
+  try {
+    const r = await api('/api/settings', { method: 'POST', body: { input_dir: inDir, output_dir: outDir } });
+    $('#settings-msg').textContent = '已保存,已重新扫描输入目录';
+    $('#settings-msg').className = 'text-sm text-green-600';
+    $('#settings-warn').classList.add('hidden');
+    toast('路径设置已更新', 'ok');
+    // 刷新当前页里所有依赖路径的视图
+    loadSystem();
+    if (typeof loadOverview === 'function') loadOverview();
+    // 路径变了，重新拉一下自己
+    setTimeout(loadSettings, 500);
+  } catch (e) {
+    const msg = e.message || String(e);
+    $('#settings-msg').textContent = '保存失败: ' + msg;
+    $('#settings-msg').className = 'text-sm text-red-600';
+    toast(msg, 'error');
+  }
+}
+
+async function resetSettingsToDefault() {
+  try {
+    const r = await api('/api/settings');
+    if (!r.defaults) return;
+    $('#settings-input-dir').value  = r.defaults.input_dir  || '';
+    $('#settings-output-dir').value = r.defaults.output_dir || '';
+    $('#settings-msg').textContent = '已填入默认值，点保存生效';
+    $('#settings-msg').className = 'text-sm text-slate-500';
+  } catch (e) {
+    toast('获取默认值失败: ' + e.message, 'error');
+  }
+}
+
+async function restartService() {
+  if (!confirm('确定要重启 video-manager 服务吗？\n连接会短暂中断（1-3 秒），然后自动恢复并刷新页面。')) return;
+  const btn = $('#btn-restart-service');
+  btn.disabled = true;
+  btn.textContent = '重启中…';
+  try {
+    // 用 fetch + ignore 中途的连接中断。服务器会主动 Connection: close。
+    await fetch('/api/service/restart', { method: 'POST', cache: 'no-store' });
+  } catch (_) {
+    // 预期内: 连接会被服务端断开
+  }
+  toast('服务重启中，请稍候…', 'info');
+  // 轮询 /api/status，最多 30 秒
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 1000));
+    try {
+      const r = await fetch('/api/status', { cache: 'no-store' });
+      if (r.ok) {
+        const j = await r.json();
+        if (j && (j.alive !== undefined || j.ffmpeg !== undefined || j.state !== undefined)) {
+          toast('服务已恢复，刷新页面', 'ok');
+          setTimeout(() => location.reload(), 600);
+          return;
+        }
+      }
+    } catch (_) {}
+  }
+  toast('服务重启超时，请手动刷新页面', 'error');
+  btn.disabled = false;
+  btn.textContent = '重启服务';
 }
 
 // ---- 配置 ----
