@@ -544,12 +544,18 @@ def _build_ffmpeg_cmd(input_file: Path, output_file: Path, hwaccel: str, ffmpeg_
         # 实测 RK3588: 12x+ 实时（软缩放只能 2x）
         # 只设 vpp_rkrga 缩放,framerate 不强制(source 通常 20fps,压缩比够好)
         # 加 format/fps 会造成 auto_scale_0 格式不兼容
+        # 码率控制:CQP(变码率,跟着内容复杂度走)
+        #   - 静态场景(监控大多数时候)自动低码率,文件变小
+        #   - 动态场景(有人动)保持质量
+        #   - -b:v 4M 作为上限防意外(5-10min 动态场景不会跳到 100MB)
         return base + [
             "-hwaccel", "rkmpp",
             "-hwaccel_output_format", "drm_prime",
             "-i", str(input_file),
             "-vf", f"vpp_rkrga=w=-2:h={_OUTPUT_HEIGHT}",
-            "-c:v", "h264_rkmpp", "-b:v", "2M",
+            "-c:v", "h264_rkmpp",
+            "-qp", "28", "-rc_mode", "2",   # CQP QP=28 变码率
+            "-b:v", "4M",                  # 上限 4Mbps(防意外)
             "-an", "-movflags", "+faststart", "-y", str(output_file),
         ]
     if hwaccel == "vaapi":
