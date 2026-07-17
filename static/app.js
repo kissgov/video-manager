@@ -1568,15 +1568,24 @@ function playVideo(streamUrl, title, info) {
   player.removeAttribute('src');
   player.load();
   player.src = streamUrl;
-  player.load();
   // 事件: 准备就绪 / 错误
-  player.onloadedmetadata = () => console.log('[video] metadata loaded', player.duration, player.videoWidth, player.videoHeight);
-  player.onerror = (e) => {
+  player.onloadedmetadata = () => {
+    console.log('[video] metadata', player.duration + 's', player.videoWidth + 'x' + player.videoHeight);
+  };
+  player.onerror = () => {
     const err = player.error;
-    console.error('[video] error', err ? `code=${err.code} msg=${err.message}` : 'unknown', e);
-    toast('视频播放失败: code=' + (err ? err.code : '?') + ', 详见浏览器控制台', 'error');
+    const codeMap = {1: 'MEDIA_ERR_ABORTED', 2: 'MEDIA_ERR_NETWORK', 3: 'MEDIA_ERR_DECODE', 4: 'MEDIA_ERR_SRC_NOT_SUPPORTED'};
+    const codeName = err ? (codeMap[err.code] || 'code=' + err.code) : 'unknown';
+    console.error('[video] error', codeName, err ? err.message : '');
+    toast('视频播放失败: ' + codeName, 'error');
   };
   player.oncanplay = () => console.log('[video] can play');
+  // 显式调用 play() (autoplay 属性可能被某些浏览器忽略)
+  player.load();
+  const playPromise = player.play();
+  if (playPromise !== undefined) {
+    playPromise.catch(err => console.warn('[video] play() rejected:', err.message));
+  }
   $('#video-modal').classList.remove('hidden');
 }
 function closeVideoModal() {

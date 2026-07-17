@@ -1199,7 +1199,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(length))
         self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", "private, max-age=0")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Connection", "keep-alive")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
@@ -2063,9 +2064,10 @@ def list_files(dir_path: Path):
             try:
                 st = p.stat()
                 items.append({
-                    "path":  str(p.relative_to(dir_path)),
-                    "size":  st.st_size,
-                    "mtime": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                    "path":    str(p.relative_to(dir_path)),
+                    "size":    st.st_size,
+                    "size_h":  human_size(st.st_size),
+                    "mtime":   datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
                 })
             except Exception:
                 continue
