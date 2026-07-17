@@ -430,6 +430,40 @@ _NICE_LEVEL     = 10
 _MIN_FILE_SIZE  = 1_048_576  # 1MB,小于视为损坏
 _MAX_LOG_LINES  = 2000
 
+def _get_setting_int(key: str, default: int) -> int:
+    try:
+        with db() as conn:
+            r = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            if r and r["value"]:
+                return int(r["value"])
+    except Exception:
+        pass
+    return default
+
+def _get_setting_bool(key: str, default: bool) -> bool:
+    try:
+        with db() as conn:
+            r = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            if r and r["value"]:
+                return r["value"] in ("1", "true", "yes", "on")
+    except Exception:
+        pass
+    return default
+
+def _get_rkmpp_qp() -> int:
+    """从 settings 读 RKMPP QP,默认 28。范围 18-36。"""
+    v = _get_setting_int("rkmpp_qp", 28)
+    return max(18, min(36, v))
+
+def _get_rkmpp_bitrate_cap() -> int:
+    """从 settings 读 RKMPP 上限码率(kbps),默认 4000。0=不限。"""
+    v = _get_setting_int("rkmpp_bitrate_cap", 4000)
+    return max(0, v)
+
+def _get_force_recompress() -> bool:
+    """UI 开关：on 时重新压缩所有 input(覆盖旧 output)。"""
+    return _get_setting_bool("force_recompress", False)
+
 _LOCK_FILE      = Path("/home/kxrdyf/scripts/compress.lock")
 _SCRIPT_LOG     = Path("/scripts/compress.log")
 
@@ -547,17 +581,22 @@ def _build_ffmpeg_cmd(input_file: Path, output_file: Path, hwaccel: str, ffmpeg_
         # 码率控制:CQP(变码率,跟着内容复杂度走)
         #   - 静态场景(监控大多数时候)自动低码率,文件变小
         #   - 动态场景(有人动)保持质量
-        #   - -b:v 4M 作为上限防意外(5-10min 动态场景不会跳到 100MB)
-        return base + [
+        #   - -b:v 作为上限防意外(动态场景不会跳到 100MB)
+        #   - QP 和 cap 都可以在 配置 页调
+        qp = _get_rkmpp_qp()
+        cap = _get_rkmpp_bitrate_cap()
+        cmd = [
             "-hwaccel", "rkmpp",
             "-hwaccel_output_format", "drm_prime",
             "-i", str(input_file),
             "-vf", f"vpp_rkrga=w=-2:h={_OUTPUT_HEIGHT}",
             "-c:v", "h264_rkmpp",
-            "-qp", "28", "-rc_mode", "2",   # CQP QP=28 变码率
-            "-b:v", "4M",                  # 上限 4Mbps(防意外)
-            "-an", "-movflags", "+faststart", "-y", str(output_file),
+            "-qp", str(qp), "-rc_mode", "2",  # CQP 变码率
         ]
+        if cap > 0:
+            cmd += ["-b:v", f"{cap}k"]
+        cmd += ["-an", "-movflags", "+faststart", "-y", str(output_file)]
+        return base + cmd
     if hwaccel == "vaapi":
         return base + [
             "-hwaccel", "vaapi", "-hwaccel_device", "/dev/dri/renderD128",
@@ -698,12 +737,19 @@ def _run_loop(run_id: int, trigger: str):
             with _state_lock:
                 _current_file = rel
 
-            # 输出已存在 -> 跳过
-            if output_file.exists():
+            # 输出已存在 -> 跳过(除非用户开了 force_recompress 重压开关)
+            if output_file.exists() and not _get_force_recompress():
                 _set_task_status(tid, "skipped", ended_at=now_str())
                 skipped += 1
                 log(f"[{i}/{len(pending)}] 跳过: {rel} (输出已存在)")
                 continue
+            if output_file.exists() and _get_force_recompress():
+                # 强制重压:删旧 output
+                try:
+                    output_file.unlink()
+                    log(f"[{i}/{len(pending)}] 强制重压: 删旧 {rel}")
+                except OSError as e:
+                    log(f"  警告: 删旧 output 失败: {e}", level=logging.WARNING)
 
             # 输入不在 -> 失败
             if not input_file.exists():
@@ -1530,6 +1576,14 @@ class Handler(BaseHTTPRequestHandler):
             cfg, _ = read_script_config()
             return json_response(self, 200, {"config": cfg, "keys": CONFIG_KEYS})
 
+        # ===== 编码参数 (QP / 码率上限 / 强制重压) =====
+        if path == "/api/enc-settings":
+            return json_response(self, 200, {
+                "qp":               _get_rkmpp_qp(),
+                "bitrate_cap":      _get_rkmpp_bitrate_cap(),
+                "force_recompress": _get_force_recompress(),
+            })
+
         if path == "/api/settings":
             return json_response(self, 200, {
                 "input_dir":  str(INPUT_DIR),
@@ -1676,6 +1730,24 @@ class Handler(BaseHTTPRequestHandler):
             if not ok:
                 return json_response(self, 400, {"ok": False, "error": msg})
             return json_response(self, 200, {"ok": True, "msg": msg, **result})
+
+        # ===== 编码参数 POST =====
+        if path == "/api/enc-settings":
+            note = []
+            if "qp" in data:
+                qp = int(data.get("qp", 28))
+                qp = max(18, min(36, qp))
+                _set_setting("rkmpp_qp", str(qp))
+                note.append(f"QP={qp}")
+            if "bitrate_cap" in data:
+                cap = max(0, int(data.get("bitrate_cap", 4000)))
+                _set_setting("rkmpp_bitrate_cap", str(cap))
+                note.append(f"码率上限={cap if cap else '无限'}kbps")
+            if "force_recompress" in data:
+                v = bool(data.get("force_recompress"))
+                _set_setting("force_recompress", "1" if v else "0")
+                note.append("强制重压=ON" if v else "强制重压=OFF")
+            return json_response(self, 200, {"ok": True, "note": " · ".join(note) or "无变更"})
 
         if path == "/api/service/restart":
             # 重启当前 video-manager 服务本身。

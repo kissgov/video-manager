@@ -492,6 +492,7 @@ async function loadSettings() {
     $('#settings-output-info').textContent = r.output_dir || '—';
     $('#settings-msg').textContent = '';
     $('#settings-warn').classList.add('hidden');
+    loadEncodingSettings();
     // 顺便拉一下磁盘占用展示在输入框下面
     try {
       const d = await api('/api/disk');
@@ -2020,4 +2021,41 @@ function humanSize(n) {
     n /= 1024;
   }
   return n.toFixed(1) + 'T';
+}
+
+// =====================================================
+// 编码参数 UI (QP / 码率上限 / 强制重压)
+// =====================================================
+async function loadEncodingSettings() {
+  try {
+    // 通过 /api/system 或 /api/settings 拿不到,新加个 /api/enc-settings
+    const r = await api('/api/enc-settings');
+    $('#enc-qp').value  = r.qp;
+    $('#enc-qp-val').textContent = r.qp;
+    $('#enc-cap').value = r.bitrate_cap;
+    $('#enc-cap-val').textContent = r.bitrate_cap;
+    $('#enc-force').checked = !!r.force_recompress;
+  } catch (e) { /* 静默忽略 */ }
+}
+
+async function saveEncodingSettings() {
+  const data = {
+    qp:                +$('#enc-qp').value,
+    bitrate_cap:       +$('#enc-cap').value,
+    force_recompress:  $('#enc-force').checked,
+  };
+  try {
+    const r = await api('/api/enc-settings', { method: 'POST', body: data });
+    if (r.ok) {
+      $('#enc-msg').textContent = '已保存 · ' + r.note;
+      $('#enc-msg').className = 'text-sm text-green-600';
+      toast('编码参数已保存', 'ok');
+    } else {
+      $('#enc-msg').textContent = r.error || '保存失败';
+      $('#enc-msg').className = 'text-sm text-red-600';
+    }
+  } catch (e) {
+    $('#enc-msg').textContent = '❌ ' + e.message;
+    $('#enc-msg').className = 'text-sm text-red-600';
+  }
 }

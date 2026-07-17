@@ -326,7 +326,6 @@
   <!-- Config -->
   <section data-panel="config" class="hidden space-y-4">
     <!-- 路径设置（热加载、不需重启服务） -->
-    <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-200">
       <div class="flex items-center justify-between mb-4">
         <div>
           <h3 class="font-semibold">路径设置</h3>
@@ -362,6 +361,62 @@
         <button onclick="saveSettings()" class="px-5 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium">保存</button>
         <button onclick="resetSettingsToDefault()" class="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-sm">恢复默认</button>
         <span id="settings-msg" class="text-sm"></span>
+      </div>
+    </div>
+
+    <!-- 编码参数 (热加载) -->
+    <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-200">
+      <div class="flex items-center justify-between mb-4">
+        <div>
+          <h3 class="font-semibold">编码参数 (RKMPP 硬编)</h3>
+          <p class="text-xs text-slate-500 mt-1">
+            存到 SQLite settings 表，热加载。不需重启服务。
+            QP 越低质量越好文件越大；推荐 24-30。
+          </p>
+        </div>
+        <button onclick="loadEncodingSettings()" class="text-xs px-3 py-1.5 rounded bg-slate-100 hover:bg-slate-200">重新读取</button>
+      </div>
+      <form id="enc-form" onsubmit="return false" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">
+            CQP 质量 (QP)
+            <span class="text-slate-400 ml-1">18-36，默认 28</span>
+          </label>
+          <div class="flex items-center gap-2">
+            <input type="range" id="enc-qp" min="18" max="36" step="1" oninput="document.getElementById('enc-qp-val').textContent=this.value"
+              class="flex-1">
+            <span id="enc-qp-val" class="font-mono text-sm w-8 text-right">28</span>
+          </div>
+          <p class="text-xs text-slate-400 mt-1">小=高质大文件, 大=低质小文件, 28 是平衡点</p>
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">
+            码率上限 (kbps)
+            <span class="text-slate-400 ml-1">0=不限, 默认 4000</span>
+          </label>
+          <div class="flex items-center gap-2">
+            <input type="range" id="enc-cap" min="0" max="10000" step="500" oninput="document.getElementById('enc-cap-val').textContent=this.value"
+              class="flex-1">
+            <span id="enc-cap-val" class="font-mono text-sm w-12 text-right">4000</span>
+          </div>
+          <p class="text-xs text-slate-400 mt-1">防动态场景跳到 100MB+</p>
+        </div>
+      </form>
+      <div class="mt-4 pt-4 border-t border-slate-200">
+        <label class="flex items-start gap-2 text-sm cursor-pointer select-none">
+          <input type="checkbox" id="enc-force" class="rounded mt-0.5">
+          <div>
+            <div class="font-medium text-slate-700">⚠️ 强制重新压缩所有文件 (覆盖旧 output)</div>
+            <div class="text-xs text-slate-500 mt-0.5">
+              默认关闭:output 已存在就跳过, 保留旧压缩文件。
+              打开后:所有 input 都重新压缩, <b>会覆盖现有 output</b>。适合改了 QP 后要重新跑。
+            </div>
+          </div>
+        </label>
+      </div>
+      <div class="mt-4 flex items-center gap-3">
+        <button onclick="saveEncodingSettings()" class="px-5 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium">保存</button>
+        <span id="enc-msg" class="text-sm"></span>
       </div>
     </div>
 
