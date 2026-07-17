@@ -1451,6 +1451,12 @@ function nodeCard(p, isSelf) {
 // ============== 集群视图切换 (状态 / 文件) ==============
 let _clusterFilesDir = 'output';
 let _clusterFilesCache = null;
+let _cfQ = '';
+let _cfSort = 'mtime';
+let _cfOrder = 'desc';
+let _cfPage = 1;
+let _cfPageSize = 50;
+let _cfSearchTimer = null;
 
 function showClusterView(view) {
   const statusView = $('#cluster-nodes');
@@ -1471,20 +1477,64 @@ function showClusterView(view) {
   }
 }
 
-async function loadClusterFiles(dir) {
+function cfSetDir(dir) {
   _clusterFilesDir = dir;
-  $('#cf-dir-output').className = dir === 'output'
-    ? 'px-3 py-1 rounded bg-blue-100 text-blue-700 text-xs'
-    : 'px-3 py-1 rounded bg-slate-100 text-slate-600 text-xs';
-  $('#cf-dir-input').className = dir === 'input'
-    ? 'px-3 py-1 rounded bg-blue-100 text-blue-700 text-xs'
-    : 'px-3 py-1 rounded bg-slate-100 text-slate-600 text-xs';
+  _cfPage = 1;
+  $('#cf-crumb-output').className = dir === 'output'
+    ? 'font-medium text-blue-600 hover:underline'
+    : 'font-medium text-slate-600 hover:underline';
+  $('#cf-crumb-input').className = dir === 'input'
+    ? 'font-medium text-blue-600 hover:underline'
+    : 'font-medium text-slate-600 hover:underline';
+  loadClusterFiles(dir);
+}
+
+function cfSetPageSize(n) {
+  _cfPageSize = n;
+  _cfPage = 1;
+  loadClusterFiles(_clusterFilesDir);
+}
+
+function cfDebounceSearch(v) {
+  clearTimeout(_cfSearchTimer);
+  _cfSearchTimer = setTimeout(() => cfDoSearch(v), 300);
+}
+function cfDoSearch(v) {
+  _cfQ = (v || '').trim();
+  _cfPage = 1;
+  loadClusterFiles(_clusterFilesDir);
+}
+
+function cfSortBy(col) {
+  if (_cfSort === col) {
+    _cfOrder = _cfOrder === 'asc' ? 'desc' : 'asc';
+  } else {
+    _cfSort = col;
+    _cfOrder = (col === 'name' || col === 'path') ? 'asc' : 'desc';
+  }
+  _cfPage = 1;
+  loadClusterFiles(_clusterFilesDir);
+}
+
+function cfGoPage(p) {
+  _cfPage = p;
+  loadClusterFiles(_clusterFilesDir);
+}
+
+async function loadClusterFiles(dir) {
+  if (dir) _clusterFilesDir = dir;
   const wrap = $('#cluster-files-content');
   wrap.innerHTML = '<div class="text-center py-6 text-slate-400">加载中...</div>';
+  const params = new URLSearchParams({dir: _clusterFilesDir});
+  if (_cfQ)          params.set('q', _cfQ);
+  if (_cfSort)       params.set('sort', _cfSort);
+  if (_cfOrder)      params.set('order', _cfOrder);
+  if (_cfPage > 1)   params.set('page', _cfPage);
+  if (_cfPageSize)   params.set('page_size', _cfPageSize);
   try {
-    const r = await api(`/api/cluster/files?dir=${dir}`);
+    const r = await api(`/api/cluster/files?${params}`);
     _clusterFilesCache = r;
-    renderClusterFiles(r, dir);
+    renderClusterFiles(r, _clusterFilesDir);
   } catch (e) {
     wrap.innerHTML = '<div class="text-red-600 text-sm">加载失败: ' + e.message + '</div>';
   }
@@ -1497,6 +1547,13 @@ function renderClusterFiles(r, dir) {
   for (const p of (r.peers || [])) cards.push(peerFilesCard(p, false, dir));
   wrap.innerHTML = cards.join('') ||
     '<div class="text-center py-6 text-slate-400">还没有 peer，点 "集群" tab 上面的 + 新增添加</div>';
+}
+
+function sortArrow(col) {
+  if (_cfSort !== col) return '<span class="text-slate-300 ml-1">↕</span>';
+  return _cfOrder === 'asc'
+    ? '<span class="text-blue-600 ml-1">↑</span>'
+    : '<span class="text-blue-600 ml-1">↓</span>';
 }
 
 function peerFilesCard(p, isSelf, dir) {
@@ -1513,54 +1570,100 @@ function peerFilesCard(p, isSelf, dir) {
       </div>`;
   }
   const f = p.files || { items: [], count: 0, total_size: 0, total_size_h: '0 B' };
-  const rows = (f.items || []).map(it => {
-    // self 用相对 URL (跟随当前 origin,HTTPS/Cloudflare 都能用)
-    // peer 用代理端点 (同源,避免 Mixed Content)
+  const items = f.items || [];
+  const rows = items.map(it => {
     const streamUrl = isSelf
       ? `/api/files/stream?dir=${dir}&path=${encodeURIComponent(it.path)}`
       : `/api/cluster/stream?peer=${encodeURIComponent(p.id)}&dir=${dir}&path=${encodeURIComponent(it.path)}`;
     const dlUrl     = isSelf
       ? `/api/files/download?dir=${dir}&path=${encodeURIComponent(it.path)}`
       : `/api/cluster/download?peer=${encodeURIComponent(p.id)}&dir=${dir}&path=${encodeURIComponent(it.path)}`;
-    const localDelete = isSelf;
+    const safePath = escapeHtml(it.path).replace(/'/g, "\\'");
+    const safeName = escapeHtml(name).replace(/'/g, "\\'");
     return `
-      <tr class="border-b border-slate-100 hover:bg-slate-50">
-        <td class="py-1 px-2 font-mono text-xs truncate max-w-[200px]" title="${escapeHtml(it.path)}">
-          <button onclick="playVideo('${escapeHtml(streamUrl)}', '${escapeHtml(it.path)}', '${escapeHtml(name)} · ${it.size_h}')" class="text-blue-600 hover:underline text-left">${escapeHtml(it.path)}</button>
+      <tr class="border-b border-slate-100 hover:bg-slate-50 cursor-pointer" onclick="playVideo('${escapeHtml(streamUrl).replace(/'/g, "\\'")}', '${safePath}', '${safeName}')">
+        <td class="py-1.5 px-2 text-sm max-w-[300px]">
+          <div class="flex items-center gap-2 min-w-0">
+            <span class="text-lg flex-shrink-0">🎬</span>
+            <span class="truncate font-mono text-xs" title="${escapeHtml(it.path)}">${escapeHtml(it.path)}</span>
+          </div>
         </td>
-        <td class="py-1 px-2 text-right text-xs text-slate-500 whitespace-nowrap">${escapeHtml(it.size_h || '')}</td>
-        <td class="py-1 px-2 text-xs text-slate-500 whitespace-nowrap">${escapeHtml(it.mtime || '')}</td>
-        <td class="py-1 px-2 text-right whitespace-nowrap">
-          <button onclick="playVideo('${escapeHtml(streamUrl)}', '${escapeHtml(it.path)}', '${escapeHtml(name)}')" class="text-blue-600 hover:text-blue-800 text-xs mr-2" title="播放">▶</button>
+        <td class="py-1.5 px-2 text-right text-xs text-slate-600 whitespace-nowrap">${escapeHtml(it.size_h || '')}</td>
+        <td class="py-1.5 px-2 text-xs text-slate-500 whitespace-nowrap">${escapeHtml(it.mtime || '')}</td>
+        <td class="py-1.5 px-2 text-right whitespace-nowrap" onclick="event.stopPropagation()">
+          <a href="${escapeHtml(streamUrl)}" target="_blank" class="text-blue-600 hover:text-blue-800 text-xs mr-2" title="新窗口打开">↗</a>
           <a href="${escapeHtml(dlUrl)}" target="_blank" download class="text-slate-600 hover:text-slate-900 text-xs mr-2" title="下载">⬇</a>
-          ${localDelete ? `<button onclick="deleteFile('${escapeHtml(it.path)}', '${dir}')" class="text-red-600 hover:text-red-800 text-xs" title="删除">×</button>` : ''}
+          ${isSelf ? `<button onclick="deleteFile('${safePath}', '${dir}')" class="text-red-600 hover:text-red-800 text-xs" title="删除">×</button>` : '<span class="text-slate-300 text-xs" title="跨节点删除需在节点本机操作">×</span>'}
         </td>
       </tr>`;
   }).join('');
   const peerUrl = p.url || '';
+  const totalPages = f.total_pages || 1;
+  const page = f.page || 1;
+  const pageSize = f.page_size || items.length || 1;
+  const startIdx = items.length > 0 ? (page - 1) * pageSize + 1 : 0;
+  const endIdx = items.length > 0 ? startIdx + items.length - 1 : 0;
+  const pagination = totalPages > 1 ? renderPagination(page, totalPages) : '';
+  const status = `${startIdx}-${endIdx} / ${f.count} 个 · ${escapeHtml(f.total_size_h || '0 B')}` +
+    (_cfQ ? ` · 搜索 "${escapeHtml(_cfQ)}"` : '');
   return `
-    <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
-      <div class="flex items-center gap-2 mb-2">
-        <span class="inline-block w-2 h-2 rounded-full bg-green-500"></span>
-        <span class="font-semibold">${escapeHtml(name)}</span>
+    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+      <div class="flex items-center gap-2 px-4 py-2 border-b border-slate-200 bg-slate-50">
+        <span class="inline-block w-2 h-2 rounded-full ${isSelf ? 'bg-blue-500' : 'bg-green-500'}"></span>
+        <span class="font-semibold text-sm">${escapeHtml(name)}</span>
         ${isSelf ? '<span class="text-xs px-1.5 py-0.5 rounded bg-blue-100 text-blue-700">本机</span>' : ''}
-        <span class="text-xs text-slate-400 ml-auto">${f.count} 个文件 · ${escapeHtml(f.total_size_h || '0 B')}</span>
+        <span class="text-xs text-slate-400 font-mono truncate">${escapeHtml(peerUrl)}</span>
       </div>
-      <div class="text-xs text-slate-500 font-mono mb-2">${escapeHtml(peerUrl)}</div>
       <div class="overflow-x-auto">
         <table class="w-full text-sm">
-          <thead class="text-xs text-slate-500 border-b">
+          <thead class="text-xs text-slate-600 border-b border-slate-200 bg-slate-50">
             <tr>
-              <th class="text-left py-1 px-2">文件名</th>
-              <th class="text-right py-1 px-2">大小</th>
-              <th class="text-left py-1 px-2">修改时间</th>
-              <th class="text-right py-1 px-2">操作</th>
+              <th class="text-left py-2 px-2 font-medium cursor-pointer hover:bg-slate-100 select-none" onclick="cfSortBy('path')">
+                🎬 文件名 ${sortArrow('path')}
+              </th>
+              <th class="text-right py-2 px-2 font-medium cursor-pointer hover:bg-slate-100 select-none whitespace-nowrap" onclick="cfSortBy('size')">
+                大小 ${sortArrow('size')}
+              </th>
+              <th class="text-left py-2 px-2 font-medium cursor-pointer hover:bg-slate-100 select-none whitespace-nowrap" onclick="cfSortBy('mtime')">
+                修改时间 ${sortArrow('mtime')}
+              </th>
+              <th class="text-right py-2 px-2 font-medium whitespace-nowrap">操作</th>
             </tr>
           </thead>
-          <tbody>${rows || '<tr><td colspan="4" class="text-center py-3 text-slate-400">空</td></tr>'}</tbody>
+          <tbody>${rows || '<tr><td colspan="4" class="text-center py-6 text-slate-400">空</td></tr>'}</tbody>
         </table>
       </div>
+      <div class="flex items-center gap-3 px-4 py-2 border-t border-slate-200 bg-slate-50 text-xs text-slate-600">
+        <span>${status}</span>
+        <span class="ml-auto">${pagination}</span>
+      </div>
     </div>`;
+}
+
+function renderPagination(page, total) {
+  if (total <= 1) return '';
+  const maxBtns = 7;
+  let start = Math.max(1, page - 3);
+  let end = Math.min(total, start + maxBtns - 1);
+  if (end - start < maxBtns - 1) start = Math.max(1, end - maxBtns + 1);
+  const btn = (p, label, cur, dis) => dis
+    ? `<span class="px-2 py-1 text-slate-300">${label}</span>`
+    : cur
+      ? `<span class="px-2 py-1 bg-blue-600 text-white rounded">${label}</span>`
+      : `<button onclick="cfGoPage(${p})" class="px-2 py-1 rounded hover:bg-slate-200">${label}</button>`;
+  let html = '';
+  html += btn(page - 1, '« 上一页', false, page <= 1);
+  if (start > 1) {
+    html += btn(1);
+    if (start > 2) html += '<span class="px-1 text-slate-400">…</span>';
+  }
+  for (let p = start; p <= end; p++) html += btn(p, p, p === page);
+  if (end < total) {
+    if (end < total - 1) html += '<span class="px-1 text-slate-400">…</span>';
+    html += btn(total);
+  }
+  html += btn(page + 1, '下一页 »', false, page >= total);
+  return html;
 }
 
 // ============== 视频播放器 ==============
