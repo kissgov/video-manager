@@ -32,6 +32,7 @@
     <button data-tab="config"   class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent hover:text-blue-600 whitespace-nowrap">配置</button>
     <button data-tab="cron"     class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent hover:text-blue-600 whitespace-nowrap">定时</button>
     <button data-tab="cluster"  class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent hover:text-blue-600 whitespace-nowrap">集群</button>
+    <button data-tab="playback" class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent hover:text-blue-600 whitespace-nowrap">📹 回放</button>
     <button data-tab="system"   class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent hover:text-blue-600 whitespace-nowrap">系统</button>
     <button data-tab="queue"    class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent hover:text-blue-600 whitespace-nowrap">队列</button>
   </nav>
@@ -622,6 +623,71 @@
       </div>
     </div>
   </div>
+
+<!-- 📹 监控回放 -->
+  <section data-panel="playback" class="hidden">
+    <div class="flex flex-col lg:flex-row gap-4" style="min-height: calc(100vh - 220px);">
+      <!-- 侧边栏: 事件列表 -->
+      <div class="w-full lg:w-80 flex-shrink-0 bg-white rounded-xl shadow-sm border border-slate-200 flex flex-col">
+        <div class="p-3 border-b border-slate-200 space-y-2">
+          <div class="flex items-center gap-2">
+            <span class="text-xs text-slate-500 whitespace-nowrap">日期</span>
+            <input id="pb-date" type="date" onchange="pbLoadList()"
+              class="flex-1 border border-slate-300 rounded px-2 py-1 text-sm">
+            <button onclick="pbClearDate()" title="清除日期筛选" class="px-2 py-1 text-xs text-slate-500 hover:text-slate-900">×</button>
+          </div>
+          <label class="flex items-center gap-2 text-sm select-none cursor-pointer">
+            <input id="pb-autoplay" type="checkbox" checked class="rounded">
+            <span>自动播放下一段</span>
+          </label>
+          <label class="flex items-center gap-2 text-sm select-none cursor-pointer">
+            <input id="pb-loop" type="checkbox" class="rounded">
+            <span>到末尾循环</span>
+          </label>
+          <div class="flex items-center gap-2">
+            <button onclick="pbLoadList()" class="flex-1 px-3 py-1.5 rounded bg-slate-100 hover:bg-slate-200 text-sm">刷新列表</button>
+          </div>
+        </div>
+        <div id="pb-stats" class="px-3 py-2 text-xs text-slate-500 border-b border-slate-200 space-y-0.5">加载中...</div>
+        <div id="pb-event-list" class="flex-1 overflow-y-auto" style="max-height: 60vh;">
+          <div class="text-center py-6 text-slate-400">加载中...</div>
+        </div>
+        <div class="p-2 border-t border-slate-200 text-xs text-slate-400">
+          快捷键: <kbd class="bg-slate-100 px-1 rounded">Space</kbd> 播放/暂停 · <kbd class="bg-slate-100 px-1 rounded">←/→</kbd> 上下段 · <kbd class="bg-slate-100 px-1 rounded">F</kbd> 全屏
+        </div>
+      </div>
+
+      <!-- 主播放器 -->
+      <div class="flex-1 bg-slate-900 rounded-xl shadow-sm flex flex-col overflow-hidden" style="min-height: 400px;">
+        <div class="flex items-center gap-2 p-3 border-b border-slate-700 flex-wrap">
+          <span class="text-slate-300 text-sm">▶</span>
+          <span id="pb-current-title" class="text-white text-sm font-medium truncate min-w-0">—</span>
+          <span id="pb-current-info" class="text-xs text-slate-400 whitespace-nowrap"></span>
+          <span class="ml-auto flex items-center gap-2">
+            <button onclick="pbPrev()" class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-white text-xs" title="上一段 (←)">⏮ 上一段</button>
+            <button onclick="pbNext()" class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-white text-xs" title="下一段 (→)">⏭ 下一段</button>
+            <button onclick="pbReplay()" class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-white text-xs" title="重播 (R)">↻ 重播</button>
+            <button onclick="pbFullscreen()" class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-white text-xs" title="全屏 (F)">⛶ 全屏</button>
+          </span>
+        </div>
+        <div id="pb-player-wrap" class="flex-1 flex items-center justify-center bg-black relative" style="min-height: 300px;">
+          <video id="pb-player" controls autoplay preload="metadata" class="max-w-full max-h-full" style="background: #000; max-height: calc(100vh - 350px);">
+            浏览器不支持 video 标签
+          </video>
+        </div>
+        <div class="p-2 border-t border-slate-700 flex items-center gap-3 text-xs flex-wrap">
+          <span class="text-slate-300">
+            <span id="pb-counter">0 / 0</span>
+          </span>
+          <span class="text-slate-500">|</span>
+          <span class="text-slate-300" id="pb-next-hint">下一个: —</span>
+          <span class="ml-auto text-slate-500">
+            <span id="pb-progress">—</span>
+          </span>
+        </div>
+      </div>
+    </div>
+  </section>
 
 <!-- System -->
     <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-200">

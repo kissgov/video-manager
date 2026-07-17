@@ -62,6 +62,7 @@ function showTab(name) {
   if (name === 'config') { loadConfig(); loadSettings(); }
   if (name === 'cron')    { loadCron(); loadSchedules(); }
   if (name === 'cluster') loadCluster();
+  if (name === 'playback') pbLoadList();
   if (name === 'cron')     loadCron();
   if (name === 'system')   loadSystem();
   if (name === 'queue')    loadQueue();
@@ -1721,4 +1722,241 @@ async function deleteFile(path, dir) {
       toast('删除失败: ' + r.error, 'error');
     }
   } catch (e) { toast('删除失败: ' + e.message, 'error'); }
+}
+// =====================================================
+// 📹 监控回放页 (专业级: 事件列表 + 自动播放下一段)
+// =====================================================
+let _pbFiles = [];      // 事件列表(已排序,按时间升序)
+let _pbIndex = -1;      // 当前播放索引
+let _pbDate = '';       // 选中的日期(YYYY-MM-DD),空=全部
+
+// 解析文件名 00_20260714131547_20260714132639.mp4
+function pbParseName(name) {
+  const m = name.match(/(\d{8})(\d{6})_(\d{8})(\d{6})/);
+  if (!m) return null;
+  const startStr = `${m[1]}${m[2]}`;
+  const endStr   = `${m[3]}${m[4]}`;
+  const fmt = (s) => `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)} ${s.slice(8,10)}:${s.slice(10,12)}:${s.slice(12,14)}`;
+  const start = fmt(startStr);
+  const end   = fmt(endStr);
+  const dur = (new Date(end.replace(/-/g,'/')) - new Date(start.replace(/-/g,'/'))) / 1000;
+  return { start, end, dur, date: m[1] };
+}
+function pbFmtDur(sec) {
+  if (sec < 60) return `${Math.round(sec)}s`;
+  if (sec < 3600) return `${Math.floor(sec/60)}m${Math.round(sec%60)}s`;
+  return `${Math.floor(sec/3600)}h${Math.floor((sec%3600)/60)}m`;
+}
+
+async function pbLoadList() {
+  _pbDate = ($('#pb-date') && $('#pb-date').value) || '';
+  const wrap = $('#pb-event-list');
+  const stats = $('#pb-stats');
+  wrap.innerHTML = '<div class="text-center py-6 text-slate-400 text-sm">加载中...</div>';
+  stats.textContent = '加载中...';
+  // sort=path 按文件名排序 = 按录像开始时间(文件名是 YYYYMMDDHHMMSS_YYYYMMDDHHMMSS)
+  try {
+    const r = await api('/api/cluster/files?dir=output&sort=path&order=asc&page_size=0');
+    const files = [];
+    if (r.self && r.self.ok) {
+      for (const f of r.self.files.items) {
+        const meta = pbParseName(f.path);
+        // 日期筛选
+        if (_pbDate) {
+          const want = _pbDate.replace(/-/g, '');
+          if (!meta || meta.date !== want) continue;
+        }
+        files.push({
+          path: f.path,
+          size: f.size, size_h: f.size_h, mtime: f.mtime,
+          meta,
+          streamUrl: `/api/files/stream?dir=output&path=${encodeURIComponent(f.path)}`,
+          isSelf: true, peerName: r.self.name,
+        });
+      }
+    }
+    // 前端再按解析出的开始时间排一遍(防止某些文件不在期望格式)
+    files.sort((a, b) => {
+      const sa = a.meta ? a.meta.start : a.mtime;
+      const sb = b.meta ? b.meta.start : b.mtime;
+      return sa.localeCompare(sb);
+    });
+    _pbFiles = files;
+    pbRenderList();
+  } catch (e) {
+    wrap.innerHTML = '<div class="text-red-600 text-sm p-3">加载失败: ' + e.message + '</div>';
+  }
+}
+
+function pbClearDate() {
+  $('#pb-date').value = '';
+  pbLoadList();
+}
+
+function pbRenderList() {
+  const wrap = $('#pb-event-list');
+  const stats = $('#pb-stats');
+  if (_pbFiles.length === 0) {
+    wrap.innerHTML = '<div class="text-center py-6 text-slate-400 text-sm">没有事件<br><span class="text-xs">(换个日期试试)</span></div>';
+    stats.innerHTML = '<div>0 个事件</div>';
+    return;
+  }
+  // 按日期 + 小时分组
+  const groups = {};
+  for (let i = 0; i < _pbFiles.length; i++) {
+    const f = _pbFiles[i];
+    const dt = f.meta ? f.meta.start.substring(0, 13).replace('T', ' ') : f.mtime.substring(0, 13);
+    if (!groups[dt]) groups[dt] = [];
+    groups[dt].push({ ...f, _origIndex: i });
+  }
+  // 统计
+  const totalDur = _pbFiles.reduce((s, f) => s + (f.meta ? f.meta.dur : 0), 0);
+  const totalSize = _pbFiles.reduce((s, f) => s + (f.size || 0), 0);
+  stats.innerHTML = `
+    <div>📊 <b>${_pbFiles.length}</b> 个事件</div>
+    <div>⏱ 总时长 <b>${pbFmtDur(totalDur)}</b></div>
+    <div>💾 <b>${humanSize(totalSize)}</b></div>
+    ${_pbDate ? `<div>📅 ${_pbDate}</div>` : '<div>📅 全部日期</div>'}
+  `;
+  // 渲染
+  let html = '';
+  for (const dt of Object.keys(groups).sort()) {
+    html += `<div class="px-3 py-1 text-xs font-medium text-slate-500 bg-slate-50 border-b border-slate-100 sticky top-0">📅 ${dt}</div>`;
+    for (const f of groups[dt]) {
+      const startT = f.meta ? f.meta.start.substring(11, 19) : f.mtime.substring(11, 19);
+      const dur = f.meta ? pbFmtDur(f.meta.dur) : '—';
+      const isCurrent = f._origIndex === _pbIndex;
+      html += `
+        <div onclick="pbPlay(${f._origIndex})"
+          data-pb-index="${f._origIndex}"
+          class="px-3 py-2 border-b border-slate-100 cursor-pointer hover:bg-blue-50 ${isCurrent ? 'bg-blue-100 border-l-4 border-l-blue-500' : ''}">
+          <div class="flex items-center gap-2">
+            <span class="text-base">${isCurrent ? '▶' : '🎬'}</span>
+            <div class="flex-1 min-w-0">
+              <div class="text-sm font-mono ${isCurrent ? 'text-blue-700 font-semibold' : 'text-slate-800'}">${startT}</div>
+              <div class="text-xs text-slate-500 flex items-center gap-2">
+                <span>⏱ ${dur}</span>
+                <span>${escapeHtml(f.size_h || '')}</span>
+              </div>
+            </div>
+          </div>
+        </div>`;
+    }
+  }
+  wrap.innerHTML = html;
+  // 自动滚动到当前行
+  if (_pbIndex >= 0) {
+    const cur = wrap.querySelector(`[data-pb-index="${_pbIndex}"]`);
+    if (cur) cur.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+}
+
+function pbPlay(index) {
+  if (index < 0 || index >= _pbFiles.length) return;
+  _pbIndex = index;
+  const f = _pbFiles[index];
+  const player = $('#pb-player');
+  player.removeAttribute('src');
+  player.load();
+  player.src = f.streamUrl;
+  player.load();
+  const playPromise = player.play();
+  if (playPromise !== undefined) {
+    playPromise.catch(err => console.warn('[pb] play() rejected:', err.message));
+  }
+  // 标题
+  const startT = f.meta ? f.meta.start : f.mtime;
+  const endT   = f.meta ? f.meta.end : '';
+  $('#pb-current-title').textContent = f.path;
+  $('#pb-current-info').textContent = `${startT}${endT ? ' → ' + endT : ''} · ${f.size_h}`;
+  $('#pb-counter').textContent = `${index + 1} / ${_pbFiles.length}`;
+  // 下一个提示
+  const next = _pbFiles[index + 1];
+  if (next) {
+    const ns = next.meta ? next.meta.start.substring(11, 19) : '—';
+    $('#pb-next-hint').textContent = `下一个 (→): ${ns} · ${escapeHtml(next.path)}`;
+  } else {
+    const loop = $('#pb-loop').checked;
+    $('#pb-next-hint').textContent = loop ? '下一个 (→): 循环到第一个' : '已是最后一段';
+  }
+  // 高亮当前行(不重渲整个列表,只切 class)
+  $$('#pb-event-list [data-pb-index]').forEach(el => {
+    el.classList.remove('bg-blue-100', 'border-l-4', 'border-l-blue-500');
+    el.querySelector('span') && (el.querySelector('span').textContent = '🎬');
+  });
+  const cur = $(`#pb-event-list [data-pb-index="${index}"]`);
+  if (cur) {
+    cur.classList.add('bg-blue-100', 'border-l-4', 'border-l-blue-500');
+    const icon = cur.querySelector('span');
+    if (icon) icon.textContent = '▶';
+    cur.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+}
+
+function pbNext() {
+  if (_pbIndex < 0) { if (_pbFiles.length) pbPlay(0); return; }
+  if (_pbIndex + 1 < _pbFiles.length) pbPlay(_pbIndex + 1);
+  else if ($('#pb-loop').checked) pbPlay(0);
+  else toast('已是最后一段', 'info');
+}
+
+function pbPrev() {
+  if (_pbIndex > 0) pbPlay(_pbIndex - 1);
+  else toast('已是第一段', 'info');
+}
+
+function pbReplay() {
+  const p = $('#pb-player');
+  p.currentTime = 0;
+  p.play();
+}
+
+function pbFullscreen() {
+  const el = $('#pb-player-wrap');
+  if (document.fullscreenElement) document.exitFullscreen();
+  else if (el.requestFullscreen) el.requestFullscreen();
+}
+
+// 视频事件
+document.addEventListener('DOMContentLoaded', () => {
+  const p = document.getElementById('pb-player');
+  if (!p) return;
+  p.addEventListener('ended', () => {
+    if ($('#pb-autoplay').checked) pbNext();
+  });
+  p.addEventListener('timeupdate', () => {
+    if (p.duration && !isNaN(p.duration)) {
+      const pct = (p.currentTime / p.duration * 100).toFixed(1);
+      $('#pb-progress').textContent = `${pbFmtDur(p.currentTime)} / ${pbFmtDur(p.duration)} (${pct}%)`;
+    }
+  });
+  p.addEventListener('error', () => {
+    const err = p.error;
+    const codeMap = {1:'ABORTED', 2:'NETWORK', 3:'DECODE', 4:'SRC_NOT_SUPPORTED'};
+    toast('播放失败: ' + (err ? codeMap[err.code] : 'unknown'), 'error');
+  });
+});
+
+// 键盘快捷键
+document.addEventListener('keydown', e => {
+  // 只在回放 tab 激活时响应
+  const panel = $('[data-panel="playback"]');
+  if (!panel || panel.classList.contains('hidden')) return;
+  // 焦点在 input/textarea 时不响应
+  const tag = (e.target.tagName || '').toLowerCase();
+  if (['input','textarea','select'].includes(tag)) return;
+  if (e.key === ' ' || e.code === 'Space') { e.preventDefault(); const p = $('#pb-player'); if (p.paused) p.play(); else p.pause(); }
+  else if (e.key === 'ArrowRight') { e.preventDefault(); pbNext(); }
+  else if (e.key === 'ArrowLeft')  { e.preventDefault(); pbPrev(); }
+  else if (e.key === 'r' || e.key === 'R') { e.preventDefault(); pbReplay(); }
+  else if (e.key === 'f' || e.key === 'F') { e.preventDefault(); pbFullscreen(); }
+});
+
+function humanSize(n) {
+  if (!n) return '0 B';
+  for (const u of ['B','K','M','G','T']) {
+    if (n < 1024) return (n < 10 ? n.toFixed(1) : Math.round(n)) + u;
+    n /= 1024;
+  }
+  return n.toFixed(1) + 'T';
 }
