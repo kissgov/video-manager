@@ -18,7 +18,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote as _urlquote
 from pathlib import Path
 
 # ============== 配置 ==============
@@ -1130,6 +1130,137 @@ class Handler(BaseHTTPRequestHandler):
         # 静默访问日志(我们自己 log)
         pass
 
+    def _safe_join(self, base: Path, rel: str):
+        """防止路径穿越。base 必须存在。"""
+        if not rel:
+            return None
+        # 拒绝绝对路径、反斜杠、空字节
+        if rel.startswith("/") or "\\" in rel or "\x00" in rel:
+            return None
+        try:
+            full = (base / rel).resolve()
+            base_r = base.resolve()
+            if not (str(full).startswith(str(base_r) + "/") or str(full) == str(base_r)):
+                return None
+            return full
+        except Exception:
+            return None
+
+    def _stream_file(self, dir_param: str, file_param: str):
+        """视频流,支持 Range 请求 + CORS。"""
+        if dir_param == "input":
+            base = INPUT_DIR
+        elif dir_param == "output":
+            base = OUTPUT_DIR
+        else:
+            return self.send_error(400, "dir must be 'input' or 'output'")
+        fp = self._safe_join(base, file_param)
+        if not fp or not fp.is_file():
+            return self.send_error(404, "not found")
+        if not os.access(fp, os.R_OK):
+            return self.send_error(403, "not readable")
+        file_size = fp.stat().st_size
+        # 猜 mime
+        suffix = fp.suffix.lower()
+        mime = {
+            ".mp4": "video/mp4", ".m4v": "video/mp4",
+            ".webm": "video/webm", ".mkv": "video/x-matroska",
+            ".mov": "video/quicktime", ".avi": "video/x-msvideo",
+        }.get(suffix, "application/octet-stream")
+        range_header = self.headers.get("Range")
+        start, end, length = 0, file_size - 1, file_size
+        status = 200
+        if range_header:
+            import re as _re
+            m = _re.match(r'^\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*$', range_header)
+            if not m:
+                self.send_header("Content-Range", f"bytes */{file_size}")
+                return self.send_error(416, "invalid Range")
+            s_str, e_str = m.group(1), m.group(2)
+            if s_str == "" and e_str != "":
+                # bytes=-N: 最后 N 字节
+                length = int(e_str)
+                start = max(0, file_size - length)
+                end = file_size - 1
+            else:
+                start = int(s_str) if s_str else 0
+                end = int(e_str) if e_str else file_size - 1
+            end = min(end, file_size - 1)
+            if start > end or start >= file_size:
+                self.send_header("Content-Range", f"bytes */{file_size}")
+                return self.send_error(416, "Range out of bounds")
+            length = end - start + 1
+            status = 206
+        self.send_response(status)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Range")
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+        self.end_headers()
+        # 流式读,8K chunk
+        try:
+            with open(fp, "rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk_size = min(8192, remaining)
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            # 客户端拖走/暂停/关闭,正常
+            pass
+        except Exception as e:
+            log(f"stream error {fp}: {e}", level=logging.WARNING)
+        return None
+
+    def _download_file(self, dir_param: str, file_param: str):
+        """文件下载,Content-Disposition: attachment。"""
+        if dir_param == "input":
+            base = INPUT_DIR
+        elif dir_param == "output":
+            base = OUTPUT_DIR
+        else:
+            return self.send_error(400, "dir must be 'input' or 'output'")
+        fp = self._safe_join(base, file_param)
+        if not fp or not fp.is_file():
+            return self.send_error(404, "not found")
+        file_size = fp.stat().st_size
+        name = fp.name
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(file_size))
+        self.send_header("Content-Disposition",
+                         f"attachment; filename*=UTF-8''{_urlquote(name)}")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        try:
+            with open(fp, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk: break
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return None
+
+    def do_OPTIONS(self):
+        # 处理 CORS preflight
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Range, Content-Type")
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.end_headers()
+        return None
+
     def _serve_file(self, path, ctype="text/plain"):
         try:
             data = Path(path).read_bytes()
@@ -1226,6 +1357,31 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/files/output":
             return json_response(self, 200, {"files": list_files(OUTPUT_DIR)})
 
+        # ---- 视频流(支持 Range,允许跨源播放)----
+        if path == "/api/files/stream":
+            dir_param = qs.get("dir", ["output"])[0]
+            file_param = qs.get("path", [""])[0]
+            return self._stream_file(dir_param, file_param)
+
+        if path == "/api/files/download":
+            dir_param = qs.get("dir", ["output"])[0]
+            file_param = qs.get("path", [""])[0]
+            return self._download_file(dir_param, file_param)
+
+        if path == "/api/files/info":
+            dir_param = qs.get("dir", ["output"])[0]
+            file_param = qs.get("path", [""])[0]
+            base = INPUT_DIR if dir_param == "input" else OUTPUT_DIR
+            fp = _safe_join(base, file_param)
+            if not fp or not fp.is_file():
+                return json_response(self, 404, {"ok": False, "error": "not found"})
+            st = fp.stat()
+            return json_response(self, 200, {
+                "ok": True, "path": str(fp), "size": st.st_size,
+                "mtime": int(st.st_mtime),
+                "mtime_h": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)),
+            })
+
         if path == "/api/stats":
             return json_response(self, 200, get_stats())
 
@@ -1313,6 +1469,10 @@ class Handler(BaseHTTPRequestHandler):
                 "peers": list(_cluster_cache["peers"].values()),
                 "last_refresh": _cluster_cache.get("last_refresh"),
             })
+
+        if path == "/api/cluster/files":
+            return json_response(self, 200,
+                _cluster_aggregate_files(qs.get("dir", ["output"])[0]))
 
         if path == "/api/cron/status":
             # 检查 ofelia 容器状态
@@ -1414,6 +1574,49 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/cron/restart":
             ok, msg = restart_ofelia()
             return json_response(self, 200, {"ok": ok, "message": msg})
+
+        # ---- 文件管理 ----
+        if path == "/api/files/delete":
+            dir_param = (data.get("dir") or "").strip()
+            file_param = (data.get("path") or "").strip()
+            base = INPUT_DIR if dir_param == "input" else OUTPUT_DIR
+            if not dir_param or not file_param:
+                return json_response(self, 400, {"ok": False, "error": "需要 dir 和 path"})
+            fp = self._safe_join(base, file_param)
+            if not fp or not fp.is_file():
+                return json_response(self, 404, {"ok": False, "error": "未找到"})
+            try:
+                size = fp.stat().st_size
+                fp.unlink()
+                log(f"已删除文件: {dir_param}/{file_param} ({size} bytes)")
+                return json_response(self, 200, {"ok": True, "size": size})
+            except Exception as e:
+                return json_response(self, 500, {"ok": False, "error": str(e)})
+
+        # ---- 集群文件聚合 ----
+        if path == "/api/cluster/files":
+            dir_param = (data.get("dir") if data else None) or qs.get("dir", ["output"])[0]
+            return json_response(self, 200, _cluster_aggregate_files(dir_param))
+
+        # ---- 集群节点对远端文件的代理操作(删除/下载)----
+        if path == "/api/cluster/file_action":
+            peer_url = (data.get("peer_url") or "").rstrip("/")
+            action = (data.get("action") or "").strip()  # "delete" | "info"
+            file_path = (data.get("path") or "").strip()
+            dir_param = (data.get("dir") or "output").strip()
+            if not peer_url or not action or not file_path:
+                return json_response(self, 400, {"ok": False, "error": "需要 peer_url, action, path"})
+            try:
+                target = f"{peer_url}/api/files/{action}"
+                req_data = json.dumps({"dir": dir_param, "path": file_path}).encode()
+                req = _urlreq.Request(target, data=req_data if action == "delete" else None,
+                                       method="POST",
+                                       headers={"Content-Type": "application/json"})
+                with _urlreq.urlopen(req, timeout=10) as r:
+                    body = r.read().decode("utf-8")
+                    return json_response(self, 200, json.loads(body))
+            except Exception as e:
+                return json_response(self, 500, {"ok": False, "error": str(e)})
 
         # ===== schedules POST =====
         if path == "/api/schedules/upsert":
@@ -2359,6 +2562,52 @@ def start_cluster():
     _cluster_thread = threading.Thread(target=_cluster_loop, daemon=True, name="cluster-heartbeat")
     _cluster_thread.start()
     log("cluster heartbeat thread started")
+
+def _cluster_aggregate_files(dir_name: str) -> dict:
+    """聚合所有 peer 的文件列表(含本机)。dir_name = 'input' | 'output'"""
+    result = {"self": None, "peers": [], "dir": dir_name}
+    # 本机
+    try:
+        base = INPUT_DIR if dir_name == "input" else OUTPUT_DIR
+        d = list_files(base)
+        result["self"] = {
+            "id": get_self_id(),
+            "name": get_self_name(),
+            "url": get_self_url(),
+            "files": d,
+            "ok": True,
+            "is_self": True,
+        }
+    except Exception as e:
+        result["self"] = {"id": get_self_id(), "name": get_self_name(),
+                          "url": get_self_url(), "ok": False, "error": str(e), "is_self": True}
+    # 远端 peers
+    raw = _get_setting("cluster.peers", "[]")
+    try:
+        peers_cfg = json.loads(raw) if raw else []
+    except Exception:
+        peers_cfg = []
+    for p in peers_cfg:
+        pid = p.get("id") or p.get("url")
+        entry = {
+            "id": pid,
+            "name": p.get("name") or pid,
+            "url": p.get("url", "").rstrip("/"),
+            "ok": False,
+            "files": None,
+        }
+        try:
+            url = f"{p['url'].rstrip('/')}/api/files/{dir_name}"
+            req = _urlreq.Request(url, headers={"User-Agent": "video-manager-cluster/1.0"})
+            with _urlreq.urlopen(req, timeout=8) as r:
+                body = r.read().decode("utf-8")
+                data = json.loads(body)
+                entry["files"] = data.get("files")
+                entry["ok"] = True
+        except Exception as e:
+            entry["error"] = str(e)
+        result["peers"].append(entry)
+    return result
 
 def update_peers(peers_list: list):
     """peers_list: [{"id":..,"name":..,"url":..}]"""

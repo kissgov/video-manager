@@ -1447,3 +1447,147 @@ function nodeCard(p, isSelf) {
     </div>
   `;
 }
+
+// ============== 集群视图切换 (状态 / 文件) ==============
+let _clusterFilesDir = 'output';
+let _clusterFilesCache = null;
+
+function showClusterView(view) {
+  const statusView = $('#cluster-nodes');
+  const filesView  = $('#cluster-files');
+  const statusBtn  = $('#cluster-view-status');
+  const filesBtn   = $('#cluster-view-files');
+  if (view === 'files') {
+    statusView.classList.add('hidden');
+    filesView.classList.remove('hidden');
+    statusBtn.className = 'px-3 py-1.5 rounded-lg bg-slate-100 text-slate-700 text-sm';
+    filesBtn.className  = 'px-3 py-1.5 rounded-lg bg-blue-100 text-blue-700 text-sm font-medium';
+    if (!_clusterFilesCache) loadClusterFiles('output');
+  } else {
+    statusView.classList.remove('hidden');
+    filesView.classList.add('hidden');
+    statusBtn.className = 'px-3 py-1.5 rounded-lg bg-blue-100 text-blue-700 text-sm font-medium';
+    filesBtn.className  = 'px-3 py-1.5 rounded-lg bg-slate-100 text-slate-700 text-sm';
+  }
+}
+
+async function loadClusterFiles(dir) {
+  _clusterFilesDir = dir;
+  $('#cf-dir-output').className = dir === 'output'
+    ? 'px-3 py-1 rounded bg-blue-100 text-blue-700 text-xs'
+    : 'px-3 py-1 rounded bg-slate-100 text-slate-600 text-xs';
+  $('#cf-dir-input').className = dir === 'input'
+    ? 'px-3 py-1 rounded bg-blue-100 text-blue-700 text-xs'
+    : 'px-3 py-1 rounded bg-slate-100 text-slate-600 text-xs';
+  const wrap = $('#cluster-files-content');
+  wrap.innerHTML = '<div class="text-center py-6 text-slate-400">加载中...</div>';
+  try {
+    const r = await api(`/api/cluster/files?dir=${dir}`);
+    _clusterFilesCache = r;
+    renderClusterFiles(r, dir);
+  } catch (e) {
+    wrap.innerHTML = '<div class="text-red-600 text-sm">加载失败: ' + e.message + '</div>';
+  }
+}
+
+function renderClusterFiles(r, dir) {
+  const wrap = $('#cluster-files-content');
+  const cards = [];
+  if (r.self) cards.push(peerFilesCard(r.self, true, dir));
+  for (const p of (r.peers || [])) cards.push(peerFilesCard(p, false, dir));
+  wrap.innerHTML = cards.join('') ||
+    '<div class="text-center py-6 text-slate-400">还没有 peer，点 "集群" tab 上面的 + 新增添加</div>';
+}
+
+function peerFilesCard(p, isSelf, dir) {
+  const name = p.name || p.id || 'unknown';
+  if (!p.ok) {
+    return `
+      <div class="bg-white rounded-xl p-4 shadow-sm border border-red-300">
+        <div class="flex items-center gap-2 mb-2">
+          <span class="inline-block w-2 h-2 rounded-full bg-red-500"></span>
+          <span class="font-semibold">${escapeHtml(name)}</span>
+          ${isSelf ? '<span class="text-xs px-1.5 py-0.5 rounded bg-blue-100 text-blue-700">本机</span>' : ''}
+        </div>
+        <div class="text-xs text-red-600">不可达: ${escapeHtml(p.error || '')}</div>
+      </div>`;
+  }
+  const f = p.files || { items: [], count: 0, total_size: 0, total_size_h: '0 B' };
+  const rows = (f.items || []).map(it => {
+    const streamUrl = `${p.url}/api/files/stream?dir=${dir}&path=${encodeURIComponent(it.path)}`;
+    const dlUrl     = `${p.url}/api/files/download?dir=${dir}&path=${encodeURIComponent(it.path)}`;
+    const localDelete = isSelf;
+    return `
+      <tr class="border-b border-slate-100 hover:bg-slate-50">
+        <td class="py-1 px-2 font-mono text-xs truncate max-w-[200px]" title="${escapeHtml(it.path)}">
+          <button onclick="playVideo('${escapeHtml(streamUrl)}', '${escapeHtml(it.path)}', '${escapeHtml(name)} · ${it.size_h}')" class="text-blue-600 hover:underline text-left">${escapeHtml(it.path)}</button>
+        </td>
+        <td class="py-1 px-2 text-right text-xs text-slate-500 whitespace-nowrap">${escapeHtml(it.size_h || '')}</td>
+        <td class="py-1 px-2 text-xs text-slate-500 whitespace-nowrap">${escapeHtml(it.mtime || '')}</td>
+        <td class="py-1 px-2 text-right whitespace-nowrap">
+          <button onclick="playVideo('${escapeHtml(streamUrl)}', '${escapeHtml(it.path)}', '${escapeHtml(name)}')" class="text-blue-600 hover:text-blue-800 text-xs mr-2" title="播放">▶</button>
+          <a href="${escapeHtml(dlUrl)}" target="_blank" download class="text-slate-600 hover:text-slate-900 text-xs mr-2" title="下载">⬇</a>
+          ${localDelete ? `<button onclick="deleteFile('${escapeHtml(it.path)}', '${dir}')" class="text-red-600 hover:text-red-800 text-xs" title="删除">×</button>` : ''}
+        </td>
+      </tr>`;
+  }).join('');
+  const peerUrl = p.url || '';
+  return `
+    <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+      <div class="flex items-center gap-2 mb-2">
+        <span class="inline-block w-2 h-2 rounded-full bg-green-500"></span>
+        <span class="font-semibold">${escapeHtml(name)}</span>
+        ${isSelf ? '<span class="text-xs px-1.5 py-0.5 rounded bg-blue-100 text-blue-700">本机</span>' : ''}
+        <span class="text-xs text-slate-400 ml-auto">${f.count} 个文件 · ${escapeHtml(f.total_size_h || '0 B')}</span>
+      </div>
+      <div class="text-xs text-slate-500 font-mono mb-2">${escapeHtml(peerUrl)}</div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead class="text-xs text-slate-500 border-b">
+            <tr>
+              <th class="text-left py-1 px-2">文件名</th>
+              <th class="text-right py-1 px-2">大小</th>
+              <th class="text-left py-1 px-2">修改时间</th>
+              <th class="text-right py-1 px-2">操作</th>
+            </tr>
+          </thead>
+          <tbody>${rows || '<tr><td colspan="4" class="text-center py-3 text-slate-400">空</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>`;
+}
+
+// ============== 视频播放器 ==============
+function playVideo(streamUrl, title, info) {
+  $('#video-modal-title').textContent = title;
+  $('#video-modal-info').textContent = info || '';
+  $('#video-modal-download').href = streamUrl.replace('/stream?', '/download?');
+  const player = $('#video-modal-player');
+  player.src = streamUrl;
+  player.load();
+  $('#video-modal').classList.remove('hidden');
+}
+function closeVideoModal() {
+  const player = $('#video-modal-player');
+  try { player.pause(); } catch (_) {}
+  player.removeAttribute('src');
+  player.load();
+  $('#video-modal').classList.add('hidden');
+}
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !$('#video-modal').classList.contains('hidden')) closeVideoModal();
+});
+
+// ============== 文件删除 (本机) ==============
+async function deleteFile(path, dir) {
+  if (!confirm(`确定要删除 ${dir}/${path} 吗?\n(跨节点删除需在节点本机操作,这里只删本机)`)) return;
+  try {
+    const r = await api('/api/files/delete', { method: 'POST', body: { path, dir } });
+    if (r.ok) {
+      toast(`已删除 (${r.size} 字节)`, 'ok');
+      loadClusterFiles(_clusterFilesDir);
+    } else {
+      toast('删除失败: ' + r.error, 'error');
+    }
+  } catch (e) { toast('删除失败: ' + e.message, 'error'); }
+}

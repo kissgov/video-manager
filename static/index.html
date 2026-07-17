@@ -556,11 +556,54 @@
       </div>
     </div>
 
+    <!-- 视图切换: 状态 / 文件 -->
+    <div class="flex items-center gap-2">
+      <button id="cluster-view-status" onclick="showClusterView('status')" class="px-3 py-1.5 rounded-lg bg-blue-100 text-blue-700 text-sm font-medium">📊 状态</button>
+      <button id="cluster-view-files"  onclick="showClusterView('files')"  class="px-3 py-1.5 rounded-lg bg-slate-100 text-slate-700 text-sm">📁 文件</button>
+    </div>
+
     <!-- 节点状态卡片 -->
     <div id="cluster-nodes" class="grid grid-cols-1 md:grid-cols-2 gap-4">
       <div class="text-center py-6 text-slate-400">加载中...</div>
     </div>
+
+    <!-- 集群文件 -->
+    <div id="cluster-files" class="hidden space-y-4">
+      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200 flex flex-wrap items-center gap-3">
+        <span class="text-sm font-medium">目录:</span>
+        <div class="flex gap-1">
+          <button id="cf-dir-output" onclick="loadClusterFiles('output')" class="px-3 py-1 rounded bg-blue-100 text-blue-700 text-xs">输出</button>
+          <button id="cf-dir-input"  onclick="loadClusterFiles('input')"  class="px-3 py-1 rounded bg-slate-100 text-slate-600 text-xs">输入</button>
+        </div>
+        <button onclick="loadClusterFiles(_clusterFilesDir || 'output')" class="ml-auto px-3 py-1 rounded bg-slate-100 hover:bg-slate-200 text-xs">刷新</button>
+      </div>
+      <div id="cluster-files-content" class="space-y-3">
+        <div class="text-center py-6 text-slate-400">加载中...</div>
+      </div>
+    </div>
   </section>
+
+  <!-- 视频播放器 modal -->
+  <div id="video-modal" class="fixed inset-0 z-50 hidden" style="background: rgba(0,0,0,0.85);">
+    <div class="absolute inset-0 flex items-center justify-center p-4" onclick="if(event.target===this) closeVideoModal()">
+      <div class="bg-slate-900 rounded-lg w-full max-w-5xl flex flex-col" style="max-height: 92vh;">
+        <div class="flex items-center justify-between p-3 border-b border-slate-700">
+          <div class="flex items-center gap-2 min-w-0">
+            <span class="text-slate-300 text-sm">▶</span>
+            <h3 id="video-modal-title" class="text-white text-sm font-medium truncate">—</h3>
+          </div>
+          <div class="flex items-center gap-2">
+            <a id="video-modal-download" href="#" class="text-slate-400 hover:text-white text-xs" target="_blank" download>下载</a>
+            <button onclick="closeVideoModal()" class="text-slate-400 hover:text-white text-xl leading-none">×</button>
+          </div>
+        </div>
+        <div class="flex-1 flex items-center justify-center bg-black" style="min-height: 200px;">
+          <video id="video-modal-player" controls autoplay class="max-w-full max-h-full" style="max-height: calc(92vh - 100px);"></video>
+        </div>
+        <div id="video-modal-info" class="p-2 text-xs text-slate-400 border-t border-slate-700"></div>
+      </div>
+    </div>
+  </div>
 
 <!-- System -->
     <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-200">
