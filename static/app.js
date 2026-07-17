@@ -51,21 +51,46 @@ function formatDuration(sec) {
 }
 
 // ---- Tabs ----
+// 切走任何 tab 前调:暂停视频/关闭 modal/重置轮询
+function cleanupOnTabLeave() {
+  // 1. 暂停所有 <video> 元素(避免后台 tab 继续下带宽/CPU)
+  $$('video').forEach(v => {
+    try {
+      if (!v.paused) v.pause();
+      // 不清 src(回到原 tab 可继续)
+    } catch (_) {}
+  });
+  // 2. 关闭 video modal
+  try { closeVideoModal(); } catch (_) {}
+  // 3. 重置轮询触发器(下次轮询重新检测可见 tab)
+  _pollTrigger = 0;
+}
+
+// 切到 tab 时调:重置轮询/根据 tab 类型选择刷新策略
+function refreshOnTabEnter(name) {
+  // 重置轮询周期
+  _pollTrigger = 0;
+}
+
 function showTab(name) {
+  // 先清理上一个 tab 的状态
+  cleanupOnTabLeave();
+  // 切 tab 显示
   $$('.tab-btn').forEach(b => b.classList.toggle('border-blue-600', b.dataset.tab === name));
   $$('.tab-btn').forEach(b => b.classList.toggle('text-blue-600', b.dataset.tab === name));
   $$('[data-panel]').forEach(p => p.classList.toggle('hidden', p.dataset.panel !== name));
+  // 加载当前 tab
   if (name === 'overview') loadOverview();
   if (name === 'run')      loadRun();
   if (name === 'logs')     loadLogs();
   if (name === 'files')    loadFiles();
   if (name === 'config') { loadConfig(); loadSettings(); }
   if (name === 'cron')    { loadCron(); loadSchedules(); }
-  if (name === 'cluster') loadCluster();
+  if (name === 'cluster') { loadCluster(); _clusterFilesCache = null; }
   if (name === 'playback') pbLoadList();
-  if (name === 'cron')     loadCron();
   if (name === 'system')   loadSystem();
   if (name === 'queue')    loadQueue();
+  refreshOnTabEnter(name);
 }
 $$('.tab-btn').forEach(b => b.addEventListener('click', () => showTab(b.dataset.tab)));
 
@@ -1153,11 +1178,18 @@ $('#q-btn-rescan').addEventListener('click', async () => {
 });
 
 // ---- 自动刷新 ----
+let _pollTrigger = 0;
 setInterval(() => {
+  _pollTrigger++;
   if (!$('[data-panel="overview"]').classList.contains('hidden')) loadOverview();
   if (!$('[data-panel="run"]').classList.contains('hidden'))      refreshStatus();
   if (!$('[data-panel="logs"]').classList.contains('hidden') && $('#log-autorefresh').checked) loadLogs();
   if (!$('[data-panel="queue"]').classList.contains('hidden'))    loadQueue();
+  // cluster tab 可见时拉节点状态(worker 可能跑完新文件)
+  if (!$('[data-panel="cluster"]').classList.contains('hidden')) {
+    // 节点卡片每 6 秒(隔 3 轮)刷新一次
+    if (_pollTrigger % 3 === 0) loadCluster();
+  }
 }, 2000);
 
 // ---- 启动 ----
