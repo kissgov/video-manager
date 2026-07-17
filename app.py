@@ -1321,6 +1321,40 @@ class Handler(BaseHTTPRequestHandler):
             log(f"proxy stream error: {e}", level=logging.WARNING)
         return None
 
+    def _serve_thumbnail(self, dir_param: str, file_param: str):
+        """缩略图接口。返回 jpeg,浏览器可缓存 1 天。"""
+        thumb = get_or_make_thumbnail(dir_param, file_param)
+        if not thumb:
+            # 返回 1x1 透明 png(避免浏览器被取一次抦1x1打破缓存设计)
+            placeholder = (
+                b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+                b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\x00\x01"
+                b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(placeholder)))
+            self.send_header("Cache-Control", "public, max-age=300")
+            self.end_headers()
+            self.wfile.write(placeholder)
+            return None
+        try:
+            data = thumb.read_bytes()
+        except Exception as e:
+            log(f"thumb read error: {e}", level=logging.WARNING)
+            return self.send_error(500, str(e))
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return None
+
     def do_OPTIONS(self):
         # 处理 CORS preflight
         self.send_response(204)
@@ -1465,6 +1499,19 @@ class Handler(BaseHTTPRequestHandler):
                 "mtime": int(st.st_mtime),
                 "mtime_h": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)),
             })
+
+        # ---- 缩略图(ffmpeg 抽帧 + 缓存)----
+        if path == "/api/files/thumb":
+            dir_param = qs.get("dir", ["output"])[0]
+            file_param = qs.get("path", [""])[0]
+            return self._serve_thumbnail(dir_param, file_param)
+
+        # ---- 文件日期列表(供"自动跳下一天")----
+        if path == "/api/files/dates":
+            dir_param = qs.get("dir", ["output"])[0]
+            base = INPUT_DIR if dir_param == "input" else OUTPUT_DIR
+            dates = get_file_dates(base)
+            return json_response(self, 200, {"dir": dir_param, "dates": dates, "count": len(dates)})
 
         if path == "/api/stats":
             return json_response(self, 200, get_stats())
@@ -2221,6 +2268,84 @@ def list_files(dir_path: Path, q: str = "", sort: str = "mtime", order: str = "d
         "order": order,
         "q": q,
     }
+
+def get_file_dates(dir_path: Path) -> list:
+    """返回目录中所有 mp4 文件的日期列表(YYYY-MM-DD),按日期排序。
+    解析文件名中的 YYYYMMDD。
+    """
+    import re as _re
+    if not dir_path.exists():
+        return []
+    dates = set()
+    try:
+        for p in dir_path.rglob("*.mp4"):
+            m = _re.search(r"(\d{4})(\d{2})(\d{2})", p.name)
+            if m:
+                dates.add(f"{m.group(1)}-{m.group(2)}-{m.group(3)}")
+    except Exception:
+        return []
+    return sorted(dates)
+
+# 缩略图缓存目录
+THUMB_DIR = APP_DIR / "data" / "thumbs"
+THUMB_DIR.mkdir(parents=True, exist_ok=True)
+
+def _safe_path(base: Path, rel: str):
+    """模块级安全路径拼接(防止路径穿越)。"""
+    if not rel:
+        return None
+    if rel.startswith("/") or "\\" in rel or "\x00" in rel:
+        return None
+    try:
+        full = (base / rel).resolve()
+        base_r = base.resolve()
+        if not (str(full).startswith(str(base_r) + "/") or str(full) == str(base_r)):
+            return None
+        return full
+    except Exception:
+        return None
+
+def get_or_make_thumbnail(dir_name: str, file_path: str):
+    """获取或生成缩略图。返回 Path 或 None。"""
+    import hashlib as _hl
+    base = INPUT_DIR if dir_name == "input" else OUTPUT_DIR
+    full = _safe_path(base, file_path)
+    if not full or not full.is_file():
+        return None
+    sub = THUMB_DIR / dir_name
+    sub.mkdir(parents=True, exist_ok=True)
+    h = _hl.md5(str(full).encode("utf-8", errors="replace")).hexdigest()[:16]
+    thumb = sub / f"{h}.jpg"
+    try:
+        src_mtime = full.stat().st_mtime
+    except Exception:
+        return None
+    # 缓存命中:thumb 存在且比源文件新
+    if thumb.exists():
+        try:
+            if thumb.stat().st_mtime >= src_mtime:
+                return thumb
+        except Exception:
+            pass
+    # 抽帧:ffmpeg 从第 1 秒开始抽一帧, 缩放到 320 宽(高度自适应)
+    ffmpeg_bin = "/usr/local/bin/ffmpeg-rkmpp" if Path("/usr/local/bin/ffmpeg-rkmpp").exists() else "/usr/bin/ffmpeg"
+    try:
+        r = subprocess.run(
+            [ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error",
+             "-ss", "1", "-i", str(full),
+             "-frames:v", "1", "-q:v", "5",
+             "-vf", "scale=320:-2",
+             str(thumb)],
+            capture_output=True, text=True, timeout=20,
+        )
+        if r.returncode == 0 and thumb.exists() and thumb.stat().st_size > 0:
+            return thumb
+        log(f"thumb ffmpeg failed: {r.stderr[:200]}", level=logging.WARNING)
+    except subprocess.TimeoutExpired:
+        log(f"thumb timeout: {full}", level=logging.WARNING)
+    except Exception as e:
+        log(f"thumb error: {e}", level=logging.WARNING)
+    return None
 
 def human_size(n):
     for u in ["B","K","M","G","T"]:

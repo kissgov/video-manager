@@ -1847,14 +1847,20 @@ function pbRenderList() {
       const typeBadge = f.type === '压缩'
         ? '<span class="text-[10px] px-1 py-0 rounded bg-green-100 text-green-700">📦 压缩</span>'
         : '<span class="text-[10px] px-1 py-0 rounded bg-orange-100 text-orange-700">🎥 原片</span>';
+      // 缩略图(从第 1 秒抽, 320px 宽,懒加载)
+      const thumbUrl = `/api/files/thumb?dir=${f.dir}&path=${encodeURIComponent(f.path)}`;
       html += `
         <div onclick="pbPlay(${f._origIndex})"
           data-pb-index="${f._origIndex}"
           class="px-3 py-2 border-b border-slate-100 cursor-pointer hover:bg-blue-50 ${isCurrent ? 'bg-blue-100 border-l-4 border-l-blue-500' : ''}">
           <div class="flex items-center gap-2">
-            <span class="text-base">${isCurrent ? '▶' : '🎬'}</span>
+            <img src="${escapeHtml(thumbUrl)}" loading="lazy"
+              class="w-20 h-12 object-cover rounded flex-shrink-0 bg-slate-200"
+              onerror="this.style.visibility='hidden'"
+              alt="">
             <div class="flex-1 min-w-0">
               <div class="flex items-center gap-1">
+                <span class="text-base">${isCurrent ? '▶' : '🎬'}</span>
                 <span class="text-sm font-mono ${isCurrent ? 'text-blue-700 font-semibold' : 'text-slate-800'}">${startT}</span>
                 ${typeBadge}
               </div>
@@ -1919,9 +1925,40 @@ function pbPlay(index) {
 
 function pbNext() {
   if (_pbIndex < 0) { if (_pbFiles.length) pbPlay(0); return; }
-  if (_pbIndex + 1 < _pbFiles.length) pbPlay(_pbIndex + 1);
-  else if ($('#pb-loop').checked) pbPlay(0);
+  if (_pbIndex + 1 < _pbFiles.length) {
+    pbPlay(_pbIndex + 1);
+    return;
+  }
+  // 最后一段了
+  if ($('#pb-auto-next-day').checked && _pbDate) {
+    pbAutoNextDay();
+    return;
+  }
+  if ($('#pb-loop').checked) pbPlay(0);
   else toast('已是最后一段', 'info');
+}
+
+async function pbAutoNextDay() {
+  try {
+    const r = await api(`/api/files/dates?dir=${_pbDir}`);
+    const dates = r.dates || [];
+    const idx = dates.indexOf(_pbDate);
+    if (idx < 0 || idx + 1 >= dates.length) {
+      // 没有下一天
+      if ($('#pb-loop').checked) pbPlay(0);
+      else toast('已是最后一天最后一段', 'info');
+      return;
+    }
+    const next = dates[idx + 1];
+    $('#pb-date').value = next;
+    _pbDate = next;
+    toast(`自动跳到 ${next}`, 'info');
+    await pbLoadList();
+    if (_pbFiles.length > 0) pbPlay(0);
+    else pbAutoNextDay();  // 该天为空(罕见), 继续跳
+  } catch (e) {
+    toast('跳到下一天失败: ' + e.message, 'error');
+  }
 }
 
 function pbPrev() {
