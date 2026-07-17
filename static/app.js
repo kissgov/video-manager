@@ -1729,6 +1729,7 @@ async function deleteFile(path, dir) {
 let _pbFiles = [];      // 事件列表(已排序,按时间升序)
 let _pbIndex = -1;      // 当前播放索引
 let _pbDate = '';       // 选中的日期(YYYY-MM-DD),空=全部
+let _pbDir = 'output';  // 'output' | 'input' | 'all'
 
 // 解析文件名 00_20260714131547_20260714132639.mp4
 function pbParseName(name) {
@@ -1748,34 +1749,51 @@ function pbFmtDur(sec) {
   return `${Math.floor(sec/3600)}h${Math.floor((sec%3600)/60)}m`;
 }
 
+function pbSetDir(d) {
+  _pbDir = d;
+  // 按钮高亮
+  for (const v of ['output', 'input', 'all']) {
+    const b = document.getElementById('pb-dir-' + v);
+    if (!b) continue;
+    if (v === d) b.className = 'flex-1 px-2 py-1 rounded text-xs font-medium bg-blue-100 text-blue-700';
+    else b.className = 'flex-1 px-2 py-1 rounded text-xs font-medium text-slate-600 hover:text-slate-900';
+  }
+  pbLoadList();
+}
+
 async function pbLoadList() {
   _pbDate = ($('#pb-date') && $('#pb-date').value) || '';
   const wrap = $('#pb-event-list');
   const stats = $('#pb-stats');
   wrap.innerHTML = '<div class="text-center py-6 text-slate-400 text-sm">加载中...</div>';
   stats.textContent = '加载中...';
-  // sort=path 按文件名排序 = 按录像开始时间(文件名是 YYYYMMDDHHMMSS_YYYYMMDDHHMMSS)
+  // 根据 _pbDir 决定加载哪些目录
+  const dirs = _pbDir === 'all' ? ['output', 'input'] : [_pbDir];
+  // sort=path 按文件名排序 = 按录像开始时间
   try {
-    const r = await api('/api/cluster/files?dir=output&sort=path&order=asc&page_size=0');
     const files = [];
-    if (r.self && r.self.ok) {
-      for (const f of r.self.files.items) {
-        const meta = pbParseName(f.path);
-        // 日期筛选
-        if (_pbDate) {
-          const want = _pbDate.replace(/-/g, '');
-          if (!meta || meta.date !== want) continue;
+    for (const d of dirs) {
+      const r = await api(`/api/cluster/files?dir=${d}&sort=path&order=asc&page_size=0`);
+      if (r.self && r.self.ok) {
+        for (const f of r.self.files.items) {
+          const meta = pbParseName(f.path);
+          if (_pbDate) {
+            const want = _pbDate.replace(/-/g, '');
+            if (!meta || meta.date !== want) continue;
+          }
+          files.push({
+            path: f.path,
+            size: f.size, size_h: f.size_h, mtime: f.mtime,
+            meta,
+            dir: d,
+            type: d === 'output' ? '压缩' : '原片',
+            streamUrl: `/api/files/stream?dir=${d}&path=${encodeURIComponent(f.path)}`,
+            isSelf: true, peerName: r.self.name,
+          });
         }
-        files.push({
-          path: f.path,
-          size: f.size, size_h: f.size_h, mtime: f.mtime,
-          meta,
-          streamUrl: `/api/files/stream?dir=output&path=${encodeURIComponent(f.path)}`,
-          isSelf: true, peerName: r.self.name,
-        });
       }
     }
-    // 前端再按解析出的开始时间排一遍(防止某些文件不在期望格式)
+    // 按解析出的开始时间排序(防名称异常)
     files.sort((a, b) => {
       const sa = a.meta ? a.meta.start : a.mtime;
       const sb = b.meta ? b.meta.start : b.mtime;
@@ -1826,6 +1844,9 @@ function pbRenderList() {
       const startT = f.meta ? f.meta.start.substring(11, 19) : f.mtime.substring(11, 19);
       const dur = f.meta ? pbFmtDur(f.meta.dur) : '—';
       const isCurrent = f._origIndex === _pbIndex;
+      const typeBadge = f.type === '压缩'
+        ? '<span class="text-[10px] px-1 py-0 rounded bg-green-100 text-green-700">📦 压缩</span>'
+        : '<span class="text-[10px] px-1 py-0 rounded bg-orange-100 text-orange-700">🎥 原片</span>';
       html += `
         <div onclick="pbPlay(${f._origIndex})"
           data-pb-index="${f._origIndex}"
@@ -1833,7 +1854,10 @@ function pbRenderList() {
           <div class="flex items-center gap-2">
             <span class="text-base">${isCurrent ? '▶' : '🎬'}</span>
             <div class="flex-1 min-w-0">
-              <div class="text-sm font-mono ${isCurrent ? 'text-blue-700 font-semibold' : 'text-slate-800'}">${startT}</div>
+              <div class="flex items-center gap-1">
+                <span class="text-sm font-mono ${isCurrent ? 'text-blue-700 font-semibold' : 'text-slate-800'}">${startT}</span>
+                ${typeBadge}
+              </div>
               <div class="text-xs text-slate-500 flex items-center gap-2">
                 <span>⏱ ${dur}</span>
                 <span>${escapeHtml(f.size_h || '')}</span>
