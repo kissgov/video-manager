@@ -1,90 +1,57 @@
 # Caddyfile for video-manager cluster portal
-# 
-# 安装:
-#   sudo ./portal-setup.sh
-# 它会:
-#   1) apt install caddy
-#   2) 让你设置密码(用 caddy hash-password 生成 bcrypt)
-#   3) 替换下面的 PLACEHOLDER_HASH
-#   4) 把 Caddyfile 写到 /etc/caddy/Caddyfile
-#   5) systemctl reload caddy
+# 由 portal-setup.sh 渲染,不要直接编辑
 #
 # 访问:
-#   https://nas.example.com/nas1/  → NAS-1 (本机 video-manager)
-#   https://nas.example.com/nas2/  → NAS-2 (走 Tailscale 100.x.0.12:8765)
-#   ...
+#   http://<NAS-IP>:8888/         → 集群首页(NAS 卡片)
+#   http://<NAS-IP>:8888/nas1/    → NAS-1 video-manager
+#   http://<NAS-IP>:8888/nas2/    → NAS-2 (如 peers.conf 里启用)
 #
-# DNS:
-#   把 nas.example.com 解析到 NAS-1 的公网 IP(或用 Tailscale Funnel 暴露)
-#   Caddy 会自动从 Let's Encrypt 申请证书
+# HTTPS:
+#   - 局域网内用 http://NAS-IP:80 直接访问(无需证书)
+#   - 公网需要域名 + DNS 解析,Caddy 自动从 Let's Encrypt 申请
+#   - 或用 Tailscale Funnel 暴露(无需公网): sudo tailscale funnel 443 on
+#
+# 安全:
+#   - Tailscale Funnel 暴露时: Tailscale 自带设备认证,无需 BasicAuth
+#   - LAN 直接访问 (http://NAS-IP:8888): 假设 LAN 受信任
+#   - 如需公网直接暴露 + 二次防护,可在 handle 块前重新启用 basicauth
 
 {
-    # 全局:无 admin API,后台守护
+    # 全局:不开 admin API,守护后台
     admin off
-    auto_https off    # 如果走 Tailscale Funnel,关掉 Let's Encrypt 避免无域名失败
 }
 
-http://nas.example.com, https://nas.example.com {
-    basicauth {
-        admin PLACEHOLDER_HASH
-    }
-
-    # 首页:4 个 NAS 链接
+http://:8888 {
+    # 集群首页(由 portal-setup.sh 从 peers.conf 渲染)
     handle / {
+        header Content-Type "text/html; charset=utf-8"
         respond `<!doctype html>
 <html lang="zh">
 <head>
 <meta charset="utf-8">
 <title>video-manager 集群</title>
 <style>
-body{font-family:sans-serif;max-width:680px;margin:40px auto;padding:0 20px}
-h1{color:#1e293b}
-.card{border:1px solid #e2e8f0;border-radius:8px;padding:16px;margin:12px 0;background:#fff}
-a{color:#2563eb;text-decoration:none;font-weight:600}
-a:hover{text-decoration:underline}
-.meta{color:#64748b;font-size:13px;margin-top:4px}
+body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;max-width:680px;margin:40px auto;padding:0 20px;background:#f8fafc}
+h1{color:#1e293b;margin-bottom:8px}
+.subtitle{color:#64748b;margin-bottom:24px}
+.cards{display:grid;gap:12px}
+.card{display:block;padding:16px;border:1px solid #e2e8f0;border-radius:8px;background:#fff;text-decoration:none;color:inherit;transition:all 0.15s}
+.card:hover{border-color:#3b82f6;box-shadow:0 4px 12px rgba(59,130,246,0.1);transform:translateY(-1px)}
+.title{font-weight:600;font-size:16px;color:#1e293b;margin-bottom:4px}
+.meta{color:#64748b;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.footer{margin-top:32px;color:#94a3b8;font-size:12px;text-align:center}
 </style>
 </head>
 <body>
 <h1>🎬 video-manager 集群</h1>
-<p style="color:#64748b">4 台 NAS,各自处理自己的摄像头录像</p>
-
-<div class="card">
-  <a href="/nas1/">NAS-1 · DH4300Plus (本机)</a>
-  <div class="meta">localhost:8765</div>
-</div>
-<div class="card">
-  <a href="/nas2/">NAS-2</a>
-  <div class="meta">100.x.0.12:8765 (via Tailscale)</div>
-</div>
-<div class="card">
-  <a href="/nas3/">NAS-3</a>
-  <div class="meta">100.x.0.13:8765 (via Tailscale)</div>
-</div>
-<div class="card">
-  <a href="/nas4/">NAS-4</a>
-  <div class="meta">100.x.0.14:8765 (via Tailscale)</div>
-</div>
-
-<p style="color:#94a3b8;font-size:12px;margin-top:32px">
-Caddy 反代 + BasicAuth · video-manager @ 2026
-</p>
+<p class="subtitle">每台 NAS 独立管理自己的摄像头录像</p>
+<div class="cards">__HOME_CARDS__</div>
+<p class="footer">Caddy 反代 · video-manager portal · Tailscale Funnel 友好</p>
 </body></html>` 200
     }
 
-    # 路由分发(用 handle_path 自动剥前缀)
-    handle_path /nas1/* {
-        reverse_proxy 127.0.0.1:8765
-    }
-    handle_path /nas2/* {
-        reverse_proxy 100.x.0.12:8765
-    }
-    handle_path /nas3/* {
-        reverse_proxy 100.x.0.13:8765
-    }
-    handle_path /nas4/* {
-        reverse_proxy 100.x.0.14:8765
-    }
+    # 多 NAS 后端路由(由 portal-setup.sh 从 peers.conf 渲染)
+__BACKENDS__
 
     # 兜底
     handle {
@@ -92,14 +59,8 @@ Caddy 反代 + BasicAuth · video-manager @ 2026
     }
 }
 
-# 如果走 Tailscale Funnel,加这一段:
-#
-# https://nas.tail-net.ts.net {
-#     import main  # 引用上面块,或者直接复制
-# }
-#
-# 在 NAS-1 上启用:
+# 如果走 Tailscale Funnel(无需公网):
 #   sudo tailscale serve --bg https://443 http://localhost:80
 #   sudo tailscale funnel 443 on
-#
-# 然后用 https://nas.tail-net.ts.net/ 直接访问,自动带 Tailscale 证书
+# 然后用 https://<host>.tail-net.ts.net/ 访问,自动带 Tailscale 证书
+# 设备身份由 Tailscale 校验,无需 BasicAuth

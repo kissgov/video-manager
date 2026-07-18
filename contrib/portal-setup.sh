@@ -1,24 +1,34 @@
 #!/usr/bin/env bash
-# 在 NAS-1 上装 Caddy 门户,带 BasicAuth
+# 在 NAS 上装 Caddy 门户,多 NAS 路由 (无 BasicAuth;靠 Tailscale Funnel / LAN 信任)
 #
 # 用法: sudo ./portal-setup.sh
 #
 # 流程:
-#   1) apt install caddy
-#   2) 让你输入用户名/密码,用 caddy hash-password 生成 bcrypt
-#   3) 替换 Caddyfile 模板里的 PLACEHOLDER_HASH
-#   4) 写到 /etc/caddy/Caddyfile
-#   5) systemctl reload caddy
+#   1) apt install caddy (如果没有)
+#   2) (无 BasicAuth;Tailscale Funnel / LAN 信任)
+#   3) 读 peers.conf 生成后端路由(可注释掉暂时不存在的 NAS)
+#   4) 替换 Caddyfile 模板里的占位符
+#   5) 写到 /etc/caddy/Caddyfile
+#   6) caddy validate + systemctl reload
 #
-# 注意:
-#   - 需要解析到本机的域名(nas.example.com),Caddy 自动 HTTPS
-#   - 或者改用 Tailscale Funnel 暴露(无需公网)
-#   - Tailscale IP 在 Caddyfile 里硬编码,部署新 NAS 时要改
+# 文件:
+#   - Caddyfile.template: 含 __BACKENDS__ 占位符
+#   - peers.conf: 每行一个 NAS,格式 id=url
+#     例:
+#       nas1=http://127.0.0.1:8765
+#       #nas2=http://100.x.0.12:8765
+#       #nas3=http://100.x.0.13:8765
+#
+# 访问:
+#   http://<NAS-IP>/         → 集群首页(4 NAS 卡片)
+#   http://<NAS-IP>/nas1/    → NAS-1 video-manager
+#   http://<NAS-IP>/nas2/    → NAS-2 (如果配了)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TEMPLATE="$SCRIPT_DIR/Caddyfile.template"
+PEERS_CONF="$SCRIPT_DIR/peers.conf"
 OUTPUT="/etc/caddy/Caddyfile"
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -26,46 +36,75 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# 装 caddy
+# 装 caddy (Debian 12 仓库就有)
 if ! command -v caddy >/dev/null; then
     echo "==> 安装 caddy..."
     apt-get update
     apt-get install -y --no-install-recommends caddy
 fi
 
-# 生成密码哈希
-echo ""
-echo "==> 设置 BasicAuth"
-read -rp "  用户名 [admin]: " AUTH_USER
-AUTH_USER="${AUTH_USER:-admin}"
-echo "  请输入密码（caddy 会弹出 hash-password 提示）"
-HASH=$(caddy hash-password --plaintext 2>/dev/null || {
-    # 旧版 caddy 没 --plaintext, 走交互式
-    caddy hash-password
-})
-if [ -z "$HASH" ]; then
-    echo "❌ hash 生成失败" >&2
+# 读 peers.conf 生成后端路由
+echo "==> 读取 $PEERS_CONF"
+if [ ! -f "$PEERS_CONF" ]; then
+    echo "❌ 找不到 $PEERS_CONF" >&2
     exit 1
 fi
 
-# 替换占位符
-echo "==> 写 Caddyfile 到 $OUTPUT"
-sed -e "s/PLACEHOLDER_HASH/${HASH//\//\\/}/g" \
+BACKENDS=""
+PEER_IDS=()
+while IFS= read -r line; do
+    # 跳过注释和空行
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ -z "${line// /}" ]] && continue
+    # 解析 id=url
+    if [[ "$line" =~ ^([^=]+)=(.+)$ ]]; then
+        pid="${BASH_REMATCH[1]}"
+        url="${BASH_REMATCH[2]}"
+        pid=$(echo "$pid" | xargs)
+        url=$(echo "$url" | xargs)
+        PEER_IDS+=("$pid")
+        BACKENDS+="
+    handle_path /$pid/* {
+        reverse_proxy $url
+    }"
+    fi
+done < "$PEERS_CONF"
+
+if [ ${#PEER_IDS[@]} -eq 0 ]; then
+    echo "❌ peers.conf 里没有可用 peer" >&2
+    exit 1
+fi
+
+# 生成首页 HTML(动态)
+HOME_CARDS=""
+for pid in "${PEER_IDS[@]}"; do
+    url=$(grep "^${pid}=" "$PEERS_CONF" | head -1 | cut -d= -f2-)
+    HOME_CARDS+="
+  <a class=\"card\" href=\"/$pid/\">
+    <div class=\"title\">$pid</div>
+    <div class=\"meta\">$url</div>
+  </a>"
+done
+
+# 不设 BasicAuth (Tailscale Funnel 走设备认证, LAN 假设信任)
+AUTH_USER=""
+HASH=""
+echo "==> 跳过 BasicAuth (无认证,Tailscale/LAN 信任)"
+
+# 替换占位符 (用唯一标记,不会被误替换)
+echo "==> 生成 Caddyfile"
+sed -e "s|__HOME_CARDS__|$HOME_CARDS|g" \
+    -e "s|__BACKENDS__|$BACKENDS|g" \
     "$TEMPLATE" > "$OUTPUT"
 
-# 改用户名
-sed -i "s/admin PLACEHOLDER_HASH/${AUTH_USER} ${HASH}/g" "$OUTPUT"
-
-echo "==> 验证 Caddyfile..."
+echo "==> 验证 Caddyfile"
 if ! caddy validate --config "$OUTPUT" --adapter caddyfile 2>/tmp/caddy-validate.log; then
     echo "❌ Caddyfile 有问题:" >&2
     cat /tmp/caddy-validate.log
     exit 1
 fi
-echo "    OK"
 
-# 启动/重载
-echo "==> 重启 caddy..."
+echo "==> 启动/重载 caddy"
 systemctl enable --now caddy
 systemctl reload caddy
 sleep 1
@@ -73,12 +112,16 @@ systemctl status caddy --no-pager -l | head -10
 
 echo ""
 echo "=== 验证 ==="
-echo "curl -u $AUTH_USER:<密码> http://127.0.0.1:80/"
-echo "预期:返回 HTML,4 个 NAS 卡片"
+echo "curl http://127.0.0.1:8888/"
+echo "预期:返回 HTML,首页显示 ${#PEER_IDS[@]} 个 NAS 卡片 (无 BasicAuth)"
 echo ""
-echo "=== 下一步 ==="
-echo "1. 域名解析:把 nas.example.com A 记录指向 NAS-1 公网 IP(或 CNAME)"
-echo "   或者用 Tailscale Funnel: sudo tailscale funnel 443 on"
-echo "2. 其他 NAS 装 Tailscale: curl -fsSL https://tailscale.com/install.sh | sh"
-echo "3. 编辑 $OUTPUT 把 100.x.0.12/13/14 改成实际 Tailscale IP"
-echo "   sudo tailscale funnel 443 on"
+echo "=== peers.conf 示例 (部署新 NAS 时取消注释) ==="
+cat <<'EOF'
+  # 当前活跃:
+  nas1=http://127.0.0.1:8765
+
+  # 待部署 (取消注释 + 填真实 Tailscale IP):
+  #nas2=http://100.x.0.12:8765
+  #nas3=http://100.x.0.13:8765
+  #nas4=http://100.x.0.14:8765
+EOF
