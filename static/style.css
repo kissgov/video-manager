@@ -9,3 +9,5 @@ table th { user-select: none; }
 
 /* 防御: [hidden] 属性强制隐藏,避免 class="hidden" 被覆盖 */
 [data-panel][hidden] { display: none !important; }
+/* 双保险: 隐藏 panel 的所有子元素也强制隐藏(防止任何 utility class 覆盖) */
+[data-panel][hidden] * { display: none !important; }
