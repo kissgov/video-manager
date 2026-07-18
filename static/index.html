@@ -740,6 +740,26 @@
           <video id="pb-player" controls autoplay preload="metadata" class="max-w-full max-h-full" style="background: #000; max-height: calc(100vh - 350px);">
             浏览器不支持 video 标签
           </video>
+          <!-- 缩略图悬停预览 -->
+          <div id="pb-thumb-preview" class="hidden absolute z-20 pointer-events-none bg-black border border-slate-600 rounded shadow-xl" style="display: none;">
+            <img id="pb-thumb-preview-img" src="" alt="" class="block rounded" style="width: 200px; height: auto; background: #000;">
+            <div id="pb-thumb-preview-ts" class="absolute bottom-1 left-1 right-1 text-center text-xs text-white bg-black/70 rounded px-1 py-0.5 font-mono">0:00</div>
+          </div>
+        </div>
+        <!-- 缩略图进度条 -->
+        <div class="p-2 border-t border-slate-700">
+          <div class="flex items-center gap-2 mb-1">
+            <span class="text-xs text-slate-400">🖼 缩略图进度</span>
+            <span id="pb-thumbs-status" class="text-xs text-slate-500"></span>
+            <label class="ml-auto text-xs text-slate-400 flex items-center gap-1">
+              <input id="pb-thumbs-enabled" type="checkbox" checked class="rounded">
+              <span>启用</span>
+            </label>
+            <button id="pb-thumbs-regen" onclick="pbRegenThumbs()" class="text-xs px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 hidden">重新生成</button>
+          </div>
+          <div id="pb-thumbs-strip" class="relative overflow-x-auto overflow-y-hidden bg-slate-900 rounded p-1" style="height: 72px; white-space: nowrap;">
+            <div class="text-center text-xs text-slate-500 py-4">选择左侧视频后加载缩略图</div>
+          </div>
         </div>
         <div class="p-2 border-t border-slate-700 flex items-center gap-3 text-xs flex-wrap">
           <span class="text-slate-300">
@@ -772,9 +792,9 @@
 <div id="toast" class="fixed bottom-4 right-4 bg-slate-900 text-white text-sm px-4 py-2 rounded-lg shadow-lg opacity-0 transition-opacity pointer-events-none"></div>
 
 <footer class="text-center text-xs text-slate-400 mt-8 mb-2">
-  build: <span id="build-id">vconfigfix3307</span> · 强刷 (Ctrl+Shift+R) 拿新版
+  build: <span id="build-id">vfeatC071498</span> · 强刷 (Ctrl+Shift+R) 拿新版
 </footer>
 
-<script src="/static/app.js?v=configfix3307"></script>
+<script src="/static/app.js?v=featC071498"></script>
 </body>
 </html>

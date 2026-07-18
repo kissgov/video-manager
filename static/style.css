@@ -11,3 +11,59 @@ table th { user-select: none; }
 [data-panel][hidden] { display: none !important; }
 /* 双保险: 隐藏 panel 的所有子元素也强制隐藏(防止任何 utility class 覆盖) */
 [data-panel][hidden] * { display: none !important; }
+
+/* 缩略图进度条 */
+.pb-thumb {
+  display: inline-block;
+  width: 90px;
+  height: 60px;
+  margin: 0 1px;
+  background: #0f172a;
+  border: 2px solid transparent;
+  border-radius: 3px;
+  cursor: pointer;
+  object-fit: cover;
+  vertical-align: middle;
+  opacity: 0.7;
+  transition: opacity 0.15s, border-color 0.15s, transform 0.1s;
+}
+.pb-thumb:hover {
+  opacity: 1;
+  border-color: #3b82f6;
+  transform: scale(1.05);
+}
+.pb-thumb.pb-thumb-current {
+  opacity: 1;
+  border-color: #ef4444;
+  box-shadow: 0 0 8px rgba(239, 68, 68, 0.6);
+}
+.pb-thumb.pb-thumb-loading {
+  background: linear-gradient(90deg, #1e293b 25%, #334155 50%, #1e293b 75%);
+  background-size: 200% 100%;
+  animation: pb-thumb-skeleton 1.5s infinite;
+}
+@keyframes pb-thumb-skeleton {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+.pb-thumb-playhead {
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  width: 2px;
+  background: #ef4444;
+  pointer-events: none;
+  z-index: 10;
+  transition: left 0.1s linear;
+  box-shadow: 0 0 4px rgba(239, 68, 68, 0.8);
+}
+.pb-thumb-playhead::before {
+  content: '';
+  position: absolute;
+  top: -3px;
+  left: -3px;
+  width: 8px;
+  height: 8px;
+  background: #ef4444;
+  border-radius: 50%;
+}
