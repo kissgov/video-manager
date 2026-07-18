@@ -1407,6 +1407,34 @@ class Handler(BaseHTTPRequestHandler):
             pass
         return None
 
+    def _serve_pb_thumb(self, qs):
+        """播放进度条单帧缩略图。返回 jpeg,可缓存 1 天。"""
+        dir_param = qs.get("dir", ["output"])[0]
+        h = qs.get("h", [""])[0]
+        i = qs.get("i", ["0"])[0]
+        # 安全: h 是 md5 hex 前 16 位, i 是整数
+        import re as _re
+        if not _re.match(r'^[a-f0-9]{1,32}$', h) or not _re.match(r'^\d{1,3}$', i):
+            return self.send_error(400, "bad params")
+        thumb_path = PB_THUMB_DIR / dir_param / f"{h}_{i}.jpg"
+        if not thumb_path.exists() or not thumb_path.is_file():
+            return self.send_error(404, "thumb not found")
+        try:
+            data = thumb_path.read_bytes()
+        except Exception as e:
+            log(f"pb-thumb read error: {e}", level=logging.WARNING)
+            return self.send_error(500, str(e))
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return None
+
     def do_OPTIONS(self):
         # 处理 CORS preflight
         self.send_response(204)
@@ -1557,6 +1585,15 @@ class Handler(BaseHTTPRequestHandler):
             dir_param = qs.get("dir", ["output"])[0]
             file_param = qs.get("path", [""])[0]
             return self._serve_thumbnail(dir_param, file_param)
+
+        # ---- 播放进度条缩略图(多帧)----
+        if path == "/api/pb/thumbs":
+            dir_param = qs.get("dir", ["output"])[0]
+            file_param = qs.get("path", [""])[0]
+            count = int(qs.get("count", ["20"])[0])
+            return json_response(self, 200, get_or_make_thumbs(dir_param, file_param, count))
+        if path == "/api/pb/thumb":
+            return self._serve_pb_thumb(qs)
 
         # ---- 文件日期列表(供"自动跳下一天")----
         if path == "/api/files/dates":
@@ -2367,6 +2404,8 @@ def get_file_dates(dir_path: Path) -> list:
 # 缩略图缓存目录
 THUMB_DIR = APP_DIR / "data" / "thumbs"
 THUMB_DIR.mkdir(parents=True, exist_ok=True)
+PB_THUMB_DIR = APP_DIR / "data" / "pb_thumbs"
+PB_THUMB_DIR.mkdir(parents=True, exist_ok=True)
 
 def _safe_path(base: Path, rel: str):
     """模块级安全路径拼接(防止路径穿越)。"""
@@ -2424,6 +2463,100 @@ def get_or_make_thumbnail(dir_name: str, file_path: str):
     except Exception as e:
         log(f"thumb error: {e}", level=logging.WARNING)
     return None
+
+
+def _probe_duration(ffmpeg_bin: str, full: Path) -> float:
+    """用 ffprobe 取视频时长(秒)。失败返回 0。"""
+    ffprobe = ffmpeg_bin.replace("ffmpeg", "ffprobe")
+    if not Path(ffprobe).exists():
+        ffprobe = "ffprobe"
+    try:
+        r = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(full)],
+            capture_output=True, text=True, timeout=10,
+        )
+        return float(r.stdout.strip())
+    except Exception as e:
+        log(f"ffprobe duration error: {e}", level=logging.WARNING)
+        return 0.0
+
+
+def get_or_make_thumbs(dir_name: str, file_path: str, count: int = 20):
+    """生成播放进度条用缩略图。返回 list[ {i, t, url, cached} ]。
+    count: 缩略图数量(默认 20), 实际生成多少看 duration。
+    缓存到 data/pb_thumbs/<dir>/<hash>_<i>.jpg,源文件 mtime 变化才重抽。
+    """
+    import hashlib as _hl
+    base = INPUT_DIR if dir_name == "input" else OUTPUT_DIR
+    full = _safe_path(base, file_path)
+    if not full or not full.is_file():
+        return {"duration": 0.0, "thumbs": []}
+
+    count = max(4, min(int(count), 60))  # 限制 4-60 张
+
+    ffmpeg_bin = "/usr/local/bin/ffmpeg-rkmpp" if Path("/usr/local/bin/ffmpeg-rkmpp").exists() else "/usr/bin/ffmpeg"
+    duration = _probe_duration(ffmpeg_bin, full)
+    if duration <= 0:
+        return {"duration": 0.0, "thumbs": []}
+
+    sub = PB_THUMB_DIR / dir_name
+    sub.mkdir(parents=True, exist_ok=True)
+    h = _hl.md5(str(full).encode("utf-8", errors="replace")).hexdigest()[:16]
+
+    # 计算均匀分布的时间点,跳过首尾各 1s(避免黑帧/录制结束画面)
+    usable = max(1.0, duration - 2.0)
+    times = []
+    if count == 1:
+        times = [1.0 + usable / 2]
+    else:
+        step = usable / (count - 1)
+        times = [1.0 + i * step for i in range(count)]
+
+    try:
+        src_mtime = full.stat().st_mtime
+    except Exception:
+        src_mtime = 0
+
+    thumbs = []
+    for i, t in enumerate(times):
+        thumb_path = sub / f"{h}_{i}.jpg"
+        cached = False
+        if thumb_path.exists():
+            try:
+                if thumb_path.stat().st_mtime >= src_mtime and thumb_path.stat().st_size > 0:
+                    cached = True
+            except Exception:
+                pass
+
+        if not cached:
+            try:
+                r = subprocess.run(
+                    [ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error",
+                     "-ss", f"{t:.2f}", "-i", str(full),
+                     "-frames:v", "1", "-q:v", "6",
+                     "-vf", "scale=160:-2",
+                     str(thumb_path)],
+                    capture_output=True, text=True, timeout=15,
+                )
+                if r.returncode != 0 or not thumb_path.exists() or thumb_path.stat().st_size == 0:
+                    log(f"pb-thumb ffmpeg failed (i={i} t={t:.1f}): {r.stderr[:200]}", level=logging.WARNING)
+                    continue
+            except subprocess.TimeoutExpired:
+                log(f"pb-thumb timeout (i={i})", level=logging.WARNING)
+                continue
+            except Exception as e:
+                log(f"pb-thumb error (i={i}): {e}", level=logging.WARNING)
+                continue
+
+        thumbs.append({
+            "i": i,
+            "t": round(t, 2),
+            "url": f"/api/pb/thumb?dir={dir_name}&h={h}&i={i}",
+            "cached": cached,
+        })
+
+    return {"duration": round(duration, 2), "thumbs": thumbs}
 
 def human_size(n):
     for u in ["B","K","M","G","T"]:
