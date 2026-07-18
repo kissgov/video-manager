@@ -78,7 +78,17 @@ function showTab(name) {
   // 切 tab 显示
   $$('.tab-btn').forEach(b => b.classList.toggle('border-blue-600', b.dataset.tab === name));
   $$('.tab-btn').forEach(b => b.classList.toggle('text-blue-600', b.dataset.tab === name));
-  $$('[data-panel]').forEach(p => p.toggleAttribute('hidden', p.dataset.panel !== name));
+  // 三重保险: toggleAttribute [hidden] + 内联 style.display
+  // 任何一层被 Tailwind / CDN / tunnel 压住,另一层仍能藏住 panel
+  $$('[data-panel]').forEach(p => {
+    const shouldHide = p.dataset.panel !== name;
+    p.toggleAttribute('hidden', shouldHide);
+    if (shouldHide) {
+      p.style.setProperty('display', 'none', 'important');
+    } else {
+      p.style.removeProperty('display');
+    }
+  });
   // 加载当前 tab
   if (name === 'overview') loadOverview();
   if (name === 'run')      loadRun();
