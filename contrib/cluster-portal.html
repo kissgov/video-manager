@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<title>video-manager 集群</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;max-width:920px;margin:0 auto;padding:32px 20px;background:#f8fafc;color:#1e293b}
+  h1{color:#1e293b;margin-bottom:8px}
+  .subtitle{color:#64748b;margin-bottom:20px}
+  .toolbar{display:flex;align-items:center;gap:10px;margin-bottom:18px;font-size:13px;color:#64748b}
+  .refresh-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#22c55e;transition:background 0.2s}
+  .refresh-dot.refreshing{background:#f59e0b}
+  .refresh-dot.error{background:#ef4444}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
+  .card{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:16px;transition:all 0.15s;position:relative}
+  .card.disabled{opacity:0.55;background:#f1f5f9}
+  .card.offline{border-color:#fca5a5;background:#fef2f2}
+  .card-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+  .card-id{font-weight:600;font-size:16px}
+  .pill{font-size:11px;padding:2px 8px;border-radius:99px;font-weight:500}
+  .pill-online{background:#dcfce7;color:#15803d}
+  .pill-offline{background:#fee2e2;color:#b91c1c}
+  .pill-disabled{background:#e2e8f0;color:#475569}
+  .pill-running{background:#fef3c7;color:#a16207}
+  .card-url{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:#64748b;word-break:break-all;margin-bottom:10px}
+  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;font-size:12px;margin-bottom:12px}
+  .stat{background:#f8fafc;padding:6px 8px;border-radius:6px;text-align:center}
+  .stat-val{font-weight:600;font-size:14px;color:#1e293b}
+  .stat-lbl{color:#94a3b8;font-size:10px;margin-top:1px;text-transform:uppercase;letter-spacing:0.5px}
+  .stat.pending .stat-val{color:#2563eb}
+  .stat.running .stat-val{color:#a16207}
+  .stat.failed .stat-val{color:#b91c1c}
+  .current-file{font-size:11px;color:#475569;background:#f1f5f9;padding:6px 8px;border-radius:6px;margin-bottom:10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
+  .actions{display:flex;gap:6px;flex-wrap:wrap}
+  .btn{padding:6px 12px;border-radius:6px;font-size:12px;font-weight:500;border:none;cursor:pointer;transition:all 0.1s;display:inline-flex;align-items:center;gap:4px}
+  .btn-primary{background:#3b82f6;color:#fff}
+  .btn-primary:hover{background:#2563eb}
+  .btn-secondary{background:#f1f5f9;color:#475569;border:1px solid #e2e8f0}
+  .btn-secondary:hover{background:#e2e8f0}
+  .btn-danger{background:#fff;color:#b91c1c;border:1px solid #fca5a5}
+  .btn-danger:hover{background:#fee2e2}
+  .btn-add{background:#fff;border:2px dashed #cbd5e1;color:#64748b;width:100%;padding:24px;justify-content:center;font-size:14px}
+  .btn-add:hover{border-color:#3b82f6;color:#3b82f6;background:#eff6ff}
+  .footer{margin-top:36px;padding-top:16px;border-top:1px solid #e2e8f0;color:#94a3b8;font-size:12px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
+  /* Modal */
+  .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,0.4);display:none;align-items:center;justify-content:center;z-index:50}
+  .modal-bg.show{display:flex}
+  .modal{background:#fff;border-radius:12px;padding:24px;width:90%;max-width:420px;box-shadow:0 20px 50px rgba(0,0,0,0.2)}
+  .modal h3{font-size:18px;font-weight:600;margin-bottom:16px}
+  .field{margin-bottom:12px}
+  .field label{display:block;font-size:12px;color:#475569;margin-bottom:4px;font-weight:500}
+  .field input{width:100%;padding:8px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:14px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .field input:focus{outline:none;border-color:#3b82f6;box-shadow:0 0 0 3px rgba(59,130,246,0.1)}
+  .modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+  .toast{position:fixed;bottom:20px;right:20px;background:#0f172a;color:#fff;padding:10px 16px;border-radius:8px;font-size:13px;box-shadow:0 4px 12px rgba(0,0,0,0.2);opacity:0;transition:opacity 0.2s;pointer-events:none;z-index:100}
+  .toast.show{opacity:1}
+  .toast.error{background:#dc2626}
+  .toast.ok{background:#16a34a}
+  /* 错误小条 */
+  .err-bar{background:#fee2e2;color:#b91c1c;padding:8px 12px;border-radius:6px;font-size:12px;margin-bottom:8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+</style>
+</head>
+<body>
+<h1>🎬 video-manager 集群</h1>
+<p class="subtitle">每台 NAS 独立管理自己的摄像头录像 · 实时状态每 <span id="refresh-sec">5</span> 秒刷新</p>
+
+<div class="toolbar">
+  <span class="refresh-dot" id="dot"></span>
+  <span id="last-update">—</span>
+  <span style="margin-left:auto">节点总数: <b id="node-count">0</b></span>
+</div>
+
+<div id="err-container"></div>
+
+<div class="grid" id="grid"></div>
+
+<div class="footer">
+  <span>Caddy 反代 + cluster-portal · video-manager portal</span>
+  <span id="peers-file" style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace"></span>
+</div>
+
+<!-- Add modal -->
+<div class="modal-bg" id="modal-bg">
+  <div class="modal">
+    <h3 id="modal-title">添加 NAS 节点</h3>
+    <div class="field">
+      <label>节点 ID (URL 段名, 字母数字_-)</label>
+      <input id="f-id" placeholder="nas3" autocomplete="off">
+    </div>
+    <div class="field">
+      <label>video-manager URL</label>
+      <input id="f-url" placeholder="http://100.64.0.13:8765" autocomplete="off">
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" id="modal-save" onclick="saveModal()">添加</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const API = {
+  list:   () => fetch('./api/cluster/nodes').then(r => r.json()),
+  add:    (id, url)   => fetch('./api/cluster/nodes', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id, url})}).then(r => r.json().then(j => [r.status, j])),
+  toggle: (id, enabled) => fetch('./api/cluster/nodes/'+encodeURIComponent(id), {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled})}).then(r => r.json()),
+  remove: (id) => fetch('./api/cluster/nodes/'+encodeURIComponent(id), {method:'DELETE'}).then(r => r.json()),
+};
+
+function toast(msg, kind) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show ' + (kind || '');
+  setTimeout(() => t.classList.remove('show'), 2500);
+}
+
+function setDot(state) {
+  const d = document.getElementById('dot');
+  d.className = 'refresh-dot' + (state ? ' ' + state : '');
+}
+
+function fmtRel(ts) {
+  if (!ts) return '—';
+  const sec = Math.floor((Date.now() - ts) / 1000);
+  if (sec < 5)   return '刚刚';
+  if (sec < 60)  return sec + ' 秒前';
+  if (sec < 3600) return Math.floor(sec/60) + ' 分钟前';
+  return Math.floor(sec/3600) + ' 小时前';
+}
+
+function render(nodes) {
+  const grid = document.getElementById('grid');
+  document.getElementById('node-count').textContent = nodes.length;
+
+  // 按 enabled/online 排序: 在线在前, 离线次之, 禁用最后
+  const score = n => n.enabled ? (n.status?.online ? 0 : 1) : 2;
+  const sorted = [...nodes].sort((a, b) => score(a) - score(b) || a.id.localeCompare(b.id));
+
+  grid.innerHTML = sorted.map(n => cardHtml(n)).join('') + addCardHtml();
+}
+
+function cardHtml(n) {
+  const s = n.status || {};
+  const cls = !n.enabled ? 'disabled' : (!s.online ? 'offline' : '');
+  let pill;
+  if (!n.enabled)         pill = '<span class="pill pill-disabled">已禁用</span>';
+  else if (!s.online)     pill = '<span class="pill pill-offline">离线</span>';
+  else if (s.running)     pill = '<span class="pill pill-running">● 运行中</span>';
+  else                    pill = '<span class="pill pill-online">○ 空闲</span>';
+
+  const stats = `
+    <div class="stat pending"><div class="stat-val">${s.pending ?? '—'}</div><div class="stat-lbl">待处理</div></div>
+    <div class="stat running"><div class="stat-val">${s.running_count ?? '—'}</div><div class="stat-lbl">进行中</div></div>
+    <div class="stat failed"><div class="stat-val">${s.failed ?? '—'}</div><div class="stat-lbl">失败</div></div>
+  `;
+
+  const currentFile = (s.online && s.running && s.current_file)
+    ? `<div class="current-file">▶ ${esc(s.current_file)}</div>` : '';
+
+  const errBar = s.error
+    ? `<div class="err-bar">⚠ ${esc(s.error)}${s.pending !== undefined ? '' : ' — 该节点可能未安装 video-manager'}</div>` : '';
+
+  // 本机 (127.0.0.1 / localhost) 走 /nas1/ 反代, 远端走自身 url
+  const isLocal = n.url.includes('127.0.0.1') || n.url.includes('localhost');
+  const openUrl = isLocal ? './nas1/' : n.url;
+
+  const toggleLabel = n.enabled ? '禁用' : '启用';
+  const toggleKind  = n.enabled ? 'btn-secondary' : 'btn-primary';
+
+  return `
+    <div class="card ${cls}">
+      <div class="card-head">
+        <div class="card-id">${esc(n.id)}</div>
+        ${pill}
+      </div>
+      <div class="card-url">${esc(n.url)}</div>
+      ${errBar}
+      ${currentFile}
+      <div class="stats">${stats}</div>
+      <div class="actions">
+        <a class="btn btn-primary" href="${esc(openUrl)}" target="_blank">打开 →</a>
+        <button class="btn ${toggleKind}" onclick="doToggle('${esc(n.id)}', ${!n.enabled})">${toggleLabel}</button>
+        <button class="btn btn-danger" onclick="doRemove('${esc(n.id)}')" title="删除节点">✕</button>
+      </div>
+    </div>
+  `;
+}
+
+function addCardHtml() {
+  return `
+    <div class="card" style="background:transparent;border:0;padding:0;display:flex">
+      <button class="btn btn-add" onclick="openAddModal()">+ 添加 NAS 节点</button>
+    </div>
+  `;
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// ---- Actions ----
+
+async function refresh() {
+  setDot('refreshing');
+  const errBox = document.getElementById('err-container');
+  errBox.innerHTML = '';
+  try {
+    const data = await API.list();
+    if (data.peers_conf) document.getElementById('peers-file').textContent = data.peers_conf;
+    render(data.nodes || []);
+    setDot(null);
+    document.getElementById('last-update').textContent = '更新于 ' + new Date().toLocaleTimeString('zh-CN');
+  } catch (e) {
+    setDot('error');
+    errBox.innerHTML = `<div class="err-bar">拉取失败: ${esc(e.message)}</div>`;
+  }
+}
+
+async function doToggle(id, enabled) {
+  try {
+    const r = await API.toggle(id, enabled);
+    if (r.error) { toast(r.error, 'error'); return; }
+    toast(`${id} 已${enabled ? '启用' : '禁用'}`, 'ok');
+    refresh();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function doRemove(id) {
+  if (!confirm(`确定删除节点 ${id}? 这会从 peers.conf 移除并停止其反代路由。`)) return;
+  try {
+    const r = await API.remove(id);
+    if (r.error) { toast(r.error, 'error'); return; }
+    toast(`${id} 已删除`, 'ok');
+    refresh();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+// ---- Modal ----
+
+function openAddModal() {
+  document.getElementById('modal-title').textContent = '添加 NAS 节点';
+  document.getElementById('modal-save').textContent = '添加';
+  document.getElementById('f-id').value = '';
+  document.getElementById('f-url').value = 'http://100.64.0.';
+  document.getElementById('modal-bg').classList.add('show');
+  setTimeout(() => document.getElementById('f-id').focus(), 50);
+}
+
+function closeModal() {
+  document.getElementById('modal-bg').classList.remove('show');
+}
+
+async function saveModal() {
+  const id = document.getElementById('f-id').value.trim();
+  const url = document.getElementById('f-url').value.trim();
+  if (!id || !url) { toast('ID 和 URL 都要填', 'error'); return; }
+  try {
+    const [code, r] = await API.add(id, url);
+    if (code >= 400) { toast(r.error || '添加失败', 'error'); return; }
+    toast(`${id} 已添加`, 'ok');
+    closeModal();
+    refresh();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+// Esc 关 modal
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+// ---- Init ----
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
