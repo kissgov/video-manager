@@ -78,7 +78,7 @@ function showTab(name) {
   // 切 tab 显示
   $$('.tab-btn').forEach(b => b.classList.toggle('border-blue-600', b.dataset.tab === name));
   $$('.tab-btn').forEach(b => b.classList.toggle('text-blue-600', b.dataset.tab === name));
-  $$('[data-panel]').forEach(p => p.classList.toggle('hidden', p.dataset.panel !== name));
+  $$('[data-panel]').forEach(p => p.toggleAttribute('hidden', p.dataset.panel !== name));
   // 加载当前 tab
   if (name === 'overview') loadOverview();
   if (name === 'run')      loadRun();

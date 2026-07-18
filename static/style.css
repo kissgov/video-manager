@@ -6,3 +6,6 @@ html, body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFa
 #log-view::-webkit-scrollbar-track { background: #1e293b; }
 
 table th { user-select: none; }
+
+/* 防御: [hidden] 属性强制隐藏,避免 class="hidden" 被覆盖 */
+[data-panel][hidden] { display: none !important; }
