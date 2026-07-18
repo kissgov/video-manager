@@ -144,7 +144,7 @@
   </section>
 
   <!-- Run -->
-  <section data-panel="run" class="hidden space-y-4">
+  <section data-panel="run" class="space-y-4" hidden>
     <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-200">
       <h3 class="font-semibold mb-4">手动运行</h3>
       <div class="flex items-center gap-3 flex-wrap">
@@ -173,7 +173,7 @@
   </section>
 
   <!-- Logs -->
-  <section data-panel="logs" class="hidden space-y-4">
+  <section data-panel="logs" class="space-y-4" hidden>
     <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
       <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
         <h3 class="font-semibold">实时日志</h3>
@@ -205,7 +205,7 @@
   </section>
 
   <!-- Files -->
-  <section data-panel="files" class="hidden space-y-4">
+  <section data-panel="files" class="space-y-4" hidden>
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
       <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
         <div class="flex items-center justify-between mb-3">
@@ -249,7 +249,7 @@
   </section>
 
   <!-- Queue -->
-  <section data-panel="queue" class="hidden space-y-4">
+  <section data-panel="queue" class="space-y-4" hidden>
     <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-200">
       <!-- 统计条 -->
       <div class="flex flex-wrap items-center gap-4 mb-4">
@@ -324,7 +324,7 @@
   </section>
 
   <!-- Config -->
-  <section data-panel="config" class="hidden space-y-4">
+  <section data-panel="config" class="space-y-4" hidden>
     <!-- 路径设置（热加载、不需重启服务） -->
       <div class="flex items-center justify-between mb-4">
         <div>
@@ -445,7 +445,7 @@
   </section>
 
   <!-- Cron -->
-  <section data-panel="cron" class="hidden space-y-4">
+  <section data-panel="cron" class="space-y-4" hidden>
     <!-- 状态 + 快捷 -->
     <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
       <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
@@ -562,7 +562,7 @@
   </section>
 
   <!-- Cluster -->
-  <section data-panel="cluster" class="hidden space-y-4">
+  <section data-panel="cluster" class="space-y-4" hidden>
     <!-- 本机身份 -->
     <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-200">
       <div class="flex items-center justify-between mb-3">
@@ -680,7 +680,7 @@
   </div>
 
 <!-- 📹 监控回放 -->
-  <section data-panel="playback" class="hidden">
+  <section data-panel="playback" hidden>
     <div class="flex flex-col lg:flex-row gap-4" style="min-height: calc(100vh - 220px);">
       <!-- 侧边栏: 事件列表 -->
       <div class="w-full lg:w-80 flex-shrink-0 bg-white rounded-xl shadow-sm border border-slate-200 flex flex-col">
@@ -754,6 +754,7 @@
   </section>
 
 <!-- System -->
+<section data-panel="system" class="space-y-4" hidden>
     <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-200">
       <h3 class="font-semibold mb-3">系统信息</h3>
       <dl id="sys-info" class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-2 text-sm"></dl>
@@ -762,7 +763,7 @@
       <h3 class="font-semibold mb-3">磁盘用量</h3>
       <div id="disk-info" class="space-y-3"></div>
     </div>
-  </section>
+</section>
 
 </div>
 

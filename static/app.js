@@ -1179,14 +1179,19 @@ $('#q-btn-rescan').addEventListener('click', async () => {
 
 // ---- 自动刷新 ----
 let _pollTrigger = 0;
+// 用 [hidden] 属性判断 panel 可见性(classList 在 af51384 后不再可靠)
+const _isVisible = (sel) => {
+  const el = $(sel);
+  return el && !el.hasAttribute('hidden');
+};
 setInterval(() => {
   _pollTrigger++;
-  if (!$('[data-panel="overview"]').classList.contains('hidden')) loadOverview();
-  if (!$('[data-panel="run"]').classList.contains('hidden'))      refreshStatus();
-  if (!$('[data-panel="logs"]').classList.contains('hidden') && $('#log-autorefresh').checked) loadLogs();
-  if (!$('[data-panel="queue"]').classList.contains('hidden'))    loadQueue();
+  if (_isVisible('[data-panel="overview"]')) loadOverview();
+  if (_isVisible('[data-panel="run"]'))      refreshStatus();
+  if (_isVisible('[data-panel="logs"]') && $('#log-autorefresh').checked) loadLogs();
+  if (_isVisible('[data-panel="queue"]'))    loadQueue();
   // cluster tab 可见时拉节点状态(worker 可能跑完新文件)
-  if (!$('[data-panel="cluster"]').classList.contains('hidden')) {
+  if (_isVisible('[data-panel="cluster"]')) {
     // 节点卡片每 6 秒(隔 3 轮)刷新一次
     if (_pollTrigger % 3 === 0) loadCluster();
   }
