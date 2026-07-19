@@ -189,7 +189,8 @@ if [[ "$NEED_CLONE" == true ]]; then
   log "📦 克隆 $GIT_REPO -> $INSTALL_DIR"
   command -v git >/dev/null || { err "需要 git"; exit 1; }
   sudo_q mkdir -p "$INSTALL_DIR"
-  sudo_q chown "$INSTALL_USER:$INSTALL_USER" "$INSTALL_DIR"
+  # chown 用户即可(group 留着原 user 的 primary group,避免 $USER:$USER 报 invalid group)
+  sudo_q chown "$INSTALL_USER" "$INSTALL_DIR"
   git clone --branch "$GIT_BRANCH" --depth 1 "$GIT_REPO" "$INSTALL_DIR"
   cd "$INSTALL_DIR"
 fi
