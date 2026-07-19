@@ -22,21 +22,37 @@ from urllib.parse import urlparse, parse_qs, quote as _urlquote
 from pathlib import Path
 
 # ============== 配置 ==============
-APP_DIR        = Path("/home/kxrdyf/scripts/video-manager")
+# 默认装在脚本同级目录(env VIDEO_MANAGER_DIR 可覆盖)。这样 install.sh
+# 装到 /opt/video-manager 或 /home/x/scripts/video-manager 都能用。
+APP_DIR        = Path(os.environ.get("VIDEO_MANAGER_DIR", str(Path(__file__).parent.resolve())))
+# 备选回退:老路径(LYD 原装路径),给从老主机上 git pull 同步的便利
+if not APP_DIR.exists():
+    _legacy = Path("/home/kxrdyf/scripts/video-manager")
+    if _legacy.exists():
+        APP_DIR = _legacy
 DATA_DIR       = APP_DIR / "data"
 LOG_DIR        = APP_DIR / "logs"
 STATIC_DIR     = APP_DIR / "static"
 DB_PATH        = DATA_DIR / "history.db"
 APP_LOG_PATH   = LOG_DIR / "app.log"
 
-SCRIPT_PATH    = Path("/home/kxrdyf/scripts/compress_video.sh")
-SCRIPT_LOG     = Path("/home/kxrdyf/scripts/compress.log")
-SCRIPT_LOCK    = Path("/home/kxrdyf/scripts/compress.lock")
-OFELIA_INI     = Path("/home/kxrdyf/docker/ffmpeg/ofelia.ini")
-OFELIA_BAK     = Path("/home/kxrdyf/docker/ffmpeg/ofelia.ini.bak")
+# 脚本/ofelia 路径可以从 env 调,不设则走默认(新装机不关心这些路径)
+_SCRIPT_DIR        = Path(os.environ.get("VIDEO_MANAGER_SCRIPT_DIR",
+                                         os.environ.get("VIDEO_MANAGER_DIR",
+                                                        "/home/kxrdyf/scripts")))
+SCRIPT_PATH    = _SCRIPT_DIR / "compress_video.sh"
+SCRIPT_LOG     = _SCRIPT_DIR / "compress.log"
+SCRIPT_LOCK    = _SCRIPT_DIR / "compress.lock"
+_FFMPEG_DIR    = Path(os.environ.get("VIDEO_MANAGER_FFMPEG_DIR",
+                                     "/home/kxrdyf/docker/ffmpeg"))
+OFELIA_INI     = _FFMPEG_DIR / "ofelia.ini"
+OFELIA_BAK     = _FFMPEG_DIR / "ofelia.ini.bak"
+
 # 默认值（仅 DB 无记录时使用；首次启动会落库，之后可在 UI 配置页修改）
-_INPUT_DIR_DEFAULT  = Path("/volume1/Videos/XiaomiCamera_00_B888809C1E93")
-_OUTPUT_DIR_DEFAULT = Path("/volume1/Videos/compressed")
+_INPUT_DIR_DEFAULT  = Path(os.environ.get("VIDEO_MANAGER_INPUT_DIR",
+                                          "/volume1/Videos/XiaomiCamera_00_B888809C1E93"))
+_OUTPUT_DIR_DEFAULT = Path(os.environ.get("VIDEO_MANAGER_OUTPUT_DIR",
+                                           "/volume1/Videos/compressed"))
 INPUT_DIR  = _INPUT_DIR_DEFAULT
 OUTPUT_DIR = _OUTPUT_DIR_DEFAULT
 
