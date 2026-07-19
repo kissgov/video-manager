@@ -480,7 +480,8 @@ def _get_force_recompress() -> bool:
     """UI 开关：on 时重新压缩所有 input(覆盖旧 output)。"""
     return _get_setting_bool("force_recompress", False)
 
-_LOCK_FILE      = Path("/home/kxrdyf/scripts/compress.lock")
+_LOCK_FILE      = Path(os.environ.get("VIDEO_MANAGER_LOCK_FILE",
+                                    str(APP_DIR / "compress.lock")))
 _SCRIPT_LOG     = Path("/scripts/compress.log")
 
 _worker_thread  = None      # Thread 对象
