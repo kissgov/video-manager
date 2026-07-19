@@ -1831,6 +1831,23 @@ class Handler(BaseHTTPRequestHandler):
                 "service": "video-manager",
             })
 
+        if path == "/api/cluster/version":
+            # 供子节点 auto_update 用 — 返回 master 的 head commit
+            try:
+                commit = subprocess.check_output(
+                    ["git", "-C", str(APP_DIR), "rev-parse", "HEAD"],
+                    stderr=subprocess.DEVNULL, text=True
+                ).strip()
+            except Exception:
+                commit = "unknown"
+            return json_response(self, 200, {
+                "ok": True,
+                "version": "refactor/1",
+                "commit": commit,
+                "service": "video-manager",
+                "auto_update": _get_setting("cluster.auto_update", "1"),
+            })
+
         if path == "/api/cluster/files":
             return json_response(self, 200,
                 _cluster_aggregate_files(
@@ -1997,6 +2014,48 @@ class Handler(BaseHTTPRequestHandler):
                 page=int((data.get("page") if data else None) or qs.get("page", ["1"])[0]),
                 page_size=int((data.get("page_size") if data else None) or qs.get("page_size", ["0"])[0]),
             ))
+
+        # ---- 集群:代理远端 peer 的控制接口 (run / stop / service_restart / sync_tasks) ----
+        m_peer_control = re.match(r"^/api/cluster/(?:run|stop|service_restart|service/restart|queue/sync|queue/retry|schedule/fire|schedule/upsert)$", path)
+        if m_peer_control:
+            # peer_id 必填(body 里)
+            peer_id = (data.get("peer_id") or qs.get("peer_id", [""])[0]).strip()
+            if not peer_id:
+                return json_response(self, 400, {"ok": False, "error": "需要 peer_id 参数"})
+            # 查 peer URL(在 settings:cluster.peers 或者 _cluster_cache.peers)
+            raw = _get_setting("cluster.peers", "[]")
+            try:
+                cfg = json.loads(raw) if raw else []
+            except Exception:
+                cfg = []
+            peer = next((p for p in cfg if p.get("id") == peer_id), None)
+            if not peer:
+                # 尝试 cache 的 id
+                cached = _cluster_cache["peers"].get(peer_id, {})
+                peer_url = cached.get("url")
+                if not peer_url:
+                    return json_response(self, 404, {"ok": False, "error": f"peer {peer_id!r} 不存在"})
+            else:
+                peer_url = (peer.get("url") or "").rstrip("/")
+            # 前拼到 peer_url,path 后面的改成去掉 /api/cluster/ 前缀
+            target_path = path.replace("/api/cluster/", "/api/")
+            target_url = f"{peer_url}{target_path}"
+            try:
+                body = json.dumps(data).encode("utf-8")
+                req = _urlreq.Request(
+                    target_url, data=body, method="POST",
+                    headers={"Content-Type": "application/json", "User-Agent": "video-manager-cluster/1.0"}
+                )
+                with _urlreq.urlopen(req, timeout=15) as r:
+                    body_b = r.read()
+                    try:
+                        payload = json.loads(body_b)
+                    except Exception:
+                        payload = {"raw": body_b.decode("utf-8", errors="replace")}
+                    return json_response(self, 200, {"ok": True, "via": peer_id, "result": payload})
+            except Exception as e:
+                log(f"cluster proxy to {peer_id} failed: {e}", level=logging.WARNING)
+                return json_response(self, 502, {"ok": False, "error": f"peer {peer_id} unreachable: {e}"})
 
         # ---- 集群节点对远端文件的代理操作(删除/下载)----
         if path == "/api/cluster/file_action":
@@ -3306,12 +3365,76 @@ def _migrate_legacy_peers():
         update_peers(imported)
         log(f"启动迁移: 从 {legacy} 导入 {len(imported)} 个节点 -> settings:cluster.peers")
 
+
+_auto_update_stop = threading.Event()
+def start_auto_updater():
+    """从 master (集群 master URL) 拉代码,有差异就 git reset + 重启自己。
+
+    通过两个 DB setting 调整:
+      cluster.auto_update   "1" 或 "0" (默认 1)
+      cluster.master_url    master 节点的 /api/cluster/version baseurl
+                            (默认用 set_self() 里的 URL)
+    初始 60s 开关让其他启动 init_db 等走完,之后每 5 分钟轮询。
+    """
+    auto = _get_setting("cluster.auto_update", "1")
+    master = _get_setting("cluster.master_url", "").strip()
+    if auto != "1" or not master:
+        log(f"auto-update: skip (auto={auto!r}, master={master!r})")
+        return
+
+    def _local_commit():
+        try:
+            return subprocess.check_output(
+                ["git", "-C", str(APP_DIR), "rev-parse", "HEAD"],
+                stderr=subprocess.DEVNULL, text=True, timeout=5
+            ).strip()
+        except Exception:
+            return ""
+
+    def _run():
+        if _auto_update_stop.wait(60):
+            return
+        while not _auto_update_stop.wait(300):
+            try:
+                url = master.rstrip("/") + "/api/cluster/version"
+                with _urlreq.urlopen(url, timeout=5) as r:
+                    data = json.loads(r.read())
+                remote = (data.get("commit") or "").strip()
+                if not remote or len(remote) < 7:
+                    continue
+                local = _local_commit()
+                if not local or local == remote:
+                    continue
+                log(f"auto-update: master={remote[:7]} local={local[:7]}, pulling...")
+                subprocess.run(["git", "-C", str(APP_DIR), "fetch", "--depth=1", "origin", "main"],
+                               check=False, timeout=60, capture_output=True)
+                r = subprocess.run(["git", "-C", str(APP_DIR), "reset", "--hard", "origin/main"],
+                                   check=False, timeout=30, capture_output=True, text=True)
+                log(f"auto-update: git reset rc={r.returncode}")
+                # schedule restart by another thread (don't block serve_forever)
+                def _restart():
+                    time.sleep(1.5)  # let response settle
+                    subprocess.Popen(["sudo", "-n", "/usr/bin/systemctl", "restart", "video-manager"])
+                threading.Thread(target=_restart, daemon=True).start()
+                # 此进程即将被 systemd 重启,跳出循环
+                return
+            except Exception as e:
+                log(f"auto-update poll error: {e}", level=logging.WARNING)
+
+    t = threading.Thread(target=_run, daemon=True, name="auto-update")
+    t.start()
+    log(f"auto-update: started, polling {master} every 5 min")
+
+
 def main():
     init_db()
     load_settings()
     _migrate_legacy_peers()
     start_scheduler()
     start_cluster()
+    # auto-master URL: 如果用户在 settings 设了就用,否则回退到本机 self URL(自己决定不再拉)
+    # 用户装了 --worker,install.sh 会在 settings 里写 cluster.master_url;没设就啥也不做。
+    start_auto_updater()
     log(f"启动: 监听 {HOST}:{PORT}")
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     try:

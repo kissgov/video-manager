@@ -230,6 +230,7 @@ User=$INSTALL_USER
 WorkingDirectory=$INSTALL_DIR
 ExecStart=/usr/bin/python3 $INSTALL_DIR/app.py
 Environment=PORT=$PORT
+Environment=VIDEO_MANAGER_DIR=$INSTALL_DIR
 Restart=on-failure
 RestartSec=5
 StandardOutput=append:$INSTALL_DIR/logs/stdout.log
@@ -273,6 +274,11 @@ if [[ "$ROLE" == "worker" ]]; then
     ok "已加入集群 (在 primary 上: http://$(echo "$JOIN_URL" | sed 's|http://||;s|:.*||'):$PORT/ → 集群 tab)"
   else
     warn "远程注册失败,可在 primary UI 上手动加: id=$SELF_ID url=$SELF_URL"
+  fi
+  # 记下 master URL 到自己 DB 里 (auto_update thread 会用它拉代码)
+  if command -v sqlite3 >/dev/null; then
+    MASTER_NO_TRAIL=$(echo "$JOIN_URL" | sed 's|/$||')
+    sudo -u "$INSTALL_USER" sqlite3 "$INSTALL_DIR/data/history.db" "INSERT INTO settings(key,value,updated_at) VALUES('cluster.master_url','$MASTER_NO_TRAIL',datetime('now','localtime')) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at;" 2>&1 && ok "auto_update master_url 已设:$MASTER_NO_TRAIL" || warn "写入 cluster.master_url 失败"
   fi
 fi
 
