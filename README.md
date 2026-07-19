@@ -1,10 +1,74 @@
 # Video Manager
 
-> 单文件 Python 写的视频压缩任务管理 Web UI,自带 SQLite 历史,Python 标准库零依赖。
+> 单文件 Python 写的视频压缩任务管理 Web UI，自带 SQLite 历史，Python 标准库零依赖。  
+> 支持多机集群部署（一个 NAS 一个节点，统一 web UI 聚合）。
 
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
+
+---
+
+## 5 秒上手（全新 NAS 一键部署）
+
+```bash
+git clone https://github.com/kissgov/video-manager.git
+cd video-manager
+bash contrib/install.sh
+```
+
+跑完会输出：
+
+```
+✅ 安装完成!
+  本机 LAN:   http://192.168.2.104:8765/
+  常用命令:    systemctl status video-manager
+```
+
+打开浏览器 → 完成。
+
+---
+
+## 加新节点
+
+在第二台 NAS 上：
+
+```bash
+git clone https://github.com/kissgov/video-manager.git
+cd video-manager
+bash contrib/install.sh --worker --join=http://100.x.x.x:8765
+```
+
+回到第一台 NAS → 集群 tab → 看到新节点了。
+
+---
+
+## 常用命令
+
+| 场景 | 命令 |
+|---|---|
+| 安装主节点 | `bash contrib/install.sh` |
+| 安装 worker | `bash contrib/install.sh --worker --join=URL` |
+| 一同开公网 HTTPS | 加 `--funnel`（需 Tailscale 启用 Funnel） |
+| 升级到最新版 | `bash contrib/install.sh --update` |
+| 卸载（保留数据） | `bash contrib/install.sh --uninstall` |
+| 看状态 | `systemctl status video-manager` |
+| 看日志 | `journalctl -u video-manager -f` |
+| 重启服务 | UI 上有按钮，或 `sudo systemctl restart video-manager` |
+
+---
+
+## 第一次安装时给 sudo 免密
+
+`install.sh` 第一次跑时如果发现 sudo 提示要密码，会自动停下来教你怎么破：
+
+```bash
+sudo bash contrib/install-sudoers.sh   # 一次,以后免密
+```
+
+之后 install.sh 不会再问密码。
+
+---
 
 ## 这是什么
 
@@ -12,113 +76,79 @@
 
 - 实时看 worker 状态、当前处理文件、速度
 - 队列管理（pending / running / done / failed / skipped）
-- 实时日志跟踪（`compress.log`）
-- 文件浏览器（`/input`、`/output`）
-- 在线改 `compress_video.sh` 的参数（带备份）
-- 管理 ofelia 定时任务 + 一键重启
-- 历史压缩统计（用时、压缩比、成功率）
+- 实时日志跟踪
+- 文件浏览器（输入/输出）
+- 在线改压缩脚本参数（带备份）
+- 管理 cron 定时任务 + 一键重启
+- 多机集群：每个节点一份 web UI，集群 tab 聚合其他节点状态
+- 回放页：缩略图进度条、跨节点文件聚合、视频流代理（解决 HTTPS Mixed Content）
 
 ## 特性
 
 - **零 pip 依赖** — `app.py` 用 `http.server` + `sqlite3`，任何 Python 3.8+ 都能跑
-- **单文件后端** — `app.py` ~65KB，全部逻辑在一处
+- **单服务（一个 systemd unit）** — 不依赖 Caddy / Nginx / Docker
+- **跨平台** — RK3588 (aarch64) 自动装 RKMPP 硬编，x86 软编 fallback
 - **单 SQLite** — 历史/队列/任务都在 `data/history.db`
-- **优雅检测外部运行** — UI 显示 worker 当前跑到第几个文件，不打断现成实例
-- **自识别硬件加速** — RKMPP → VAAPI → V4L2 → QSV → libx264 自动降级
+- **多机集群** — 每节点独立，加节点跑一条命令
+- **可选公网 HTTPS** — `install.sh --funnel` 一行启用 Tailscale Funnel
 
-## 截图
+---
 
-_（占位 — 加一张 Web UI 截图效果立竿见影）_
-
-## 架构
+## 架构（重构后）
 
 ```
-┌────────────────────────────────────────────────────────┐
-│  Browser → http://NAS-IP:8765                          │
-│                                                        │
-│  ┌──────────────────────────────────────────┐          │
-│  │  python3 app.py (ThreadingHTTPServer)    │          │
-│  │  ├─ /api/queue       任务列表/CRUD       │          │
-│  │  ├─ /api/run|stop    worker 控制         │          │
-│  │  ├─ /api/logs        实时日志            │          │
-│  │  ├─ /api/files       文件浏览            │          │
-│  │  ├─ /api/config      脚本配置            │          │
-│  │  ├─ /api/cron        ofelia 管理         │          │
-│  │  └─ /static/*        SPA 前端            │          │
-│  └──────────────────────────────────────────┘          │
-│            │                                           │
-│            ├─→ SQLite (data/history.db)                │
-│            ├─→ /input → /output 软链接                 │
-│            ├─→ /scripts/compress_video.sh              │
-│            └─→ /scripts/compress.log                   │
-│                                                        │
-│  ┌──────────────────────────────────────────┐          │
-│  │  ofelia-scheduler (Docker)               │          │
-│  │  每天 02:00 → bash /scripts/compress_video.sh       │
-│  └──────────────────────────────────────────┘          │
-│            │                                           │
-│            └─→ ffmpeg-worker (Docker)                  │
-│                带 RKMPP/RKRGA 的 ffmpeg, libx264 软编兜底│
-└────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│  Browser → http://<NAS-IP>:8765         (LAN / Tailscale)      │
+│                                                                │
+│  ┌──────────────────────────────────────────┐                  │
+│  │  python3 app.py (ThreadingHTTPServer)    │  ONE service      │
+│  │  ├─ /api/queue      任务列表/CRUD         │                  │
+│  │  ├─ /api/run|stop   worker 控制           │                  │
+│  │  ├─ /api/files      本机文件浏览          │                  │
+│  │  ├─ /api/cluster/*  多机集群 (peer CRUD,  │                  │
+│  │  │                 状态聚合,文件代理)     │                  │
+│  │  └─ /static/*       SPA 前端              │                  │
+│  └──────────────────────────────────────────┘                  │
+│      │                                                         │
+│      ├─→ SQLite (data/history.db)                              │
+│      ├─→ /input → /output                                      │
+│      ├─→ ffmpeg (rkmpp 优先, libx264 兜底)                      │
+│      └─→ 其他 peer NAS (HTTP, 5s/30s 轮询)                     │
+│                                                                │
+│  可选 —— Tailscale Funnel → 公网 HTTPS                          │
+│  (不需要公网 IP，不需要证书，自动 Tailscale 设备认证)            │
+└────────────────────────────────────────────────────────────────┘
 ```
 
-## 快速开始（开发机试一下）
+**重构前 → 重构后对比**：
+- ❌ 6 个 systemd service（Caddy × 1, cluster-portal × 1, ofelia × 1, video-manager × 1, ...）
+- ❌ 5 个 deploy 脚本,每个要 sudo 跑,改 4 个配置文件
+- ❌ /etc/caddy/peers.conf 手编
+- ✅ 1 个 service，1 个 install.sh，UI 改 peers
 
-```bash
-git clone https://github.com/<your>/video-manager.git
-cd video-manager
-
-# 建软链接或编辑 app.py 顶部的 INPUT_DIR/OUTPUT_DIR
-ln -s /path/to/your/camera /input
-ln -s /path/to/compressed /output
-
-python3 app.py
-# → 浏览器打开 http://127.0.0.1:8765
-```
-
-## 部署到 NAS
-
-完整步骤见 [DEPLOY.md](./DEPLOY.md)。两件事：
-
-1. **L1 Web UI** — `app.py` + `static/` + `video-manager.service`，任何 Linux 都能跑
-2. **L2 压缩管线** — `compress_video.sh` + Docker + ofelia + RKMPP 硬编（仅 RK3588）
-
-```bash
-# L1 装服务
-sudo cp video-manager.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now video-manager
-```
+---
 
 ## 关键路径
 
 | 角色 | 路径 |
 |---|---|
-| Web UI | `http://NAS-IP:8765` |
-| 应用目录 | `/volume1/scripts/video-manager/` |
+| Web UI | `http://<NAS-IP>:8765` |
+| 应用目录 | 默认 `/opt/video-manager`（`--prefix=PATH` 改） |
 | 数据库 | `data/history.db`（gitignored） |
-| 日志 | `logs/app.log` / `logs/stdout.log` |
-| 输入 | `/input` → 摄像头录像目录 |
-| 输出 | `/output` → 压缩后目录 |
-| 压缩脚本 | `/scripts/compress_video.sh` |
+| 日志 | `logs/stdout.log` `logs/stderr.log` |
+| 集群 peers | `data/peers.json` 或 `settings:cluster.peers`（DB） |
+| 输入/输出 | 在 UI 配置 tab 改，或编辑 `app.py` 顶部 `INPUT_DIR`/`OUTPUT_DIR` |
+
+---
 
 ## 安全
 
-- 当前**无认证**，仅适合内网/受信任网络
+- 默认**无认证**，仅适合内网/受信任网络
 - `video-manager.service` 已开 `NoNewPrivileges=true` + `ProtectSystem=full`
-- 外网暴露前请套反代 + BasicAuth，或前置 VPN
+- `install.sh --funnel` 经 Tailscale 走：免 BasicAuth，Tailscale 设备身份即认证
+- LAN 公网直接暴露前请套反代 + BasicAuth，或用 `tailscale serve`+ACL 限制
 
-## 路线图
-
-- [ ] 鉴权（BasicAuth + 反代）
-- [ ] WebSocket 推送替代轮询
-- [ ] 失败任务批量重试（已支持单个，重试 API 现成）
-- [ ] Prometheus `/metrics`
-- [ ] 迁移到 FastAPI（保持单文件分发）
-
-## 贡献
-
-PR 欢迎。建议在改 `app.py` 前先跑 `python3 -m py_compile app.py`，CI 还没接。
+---
 
 ## 协议
 
@@ -128,5 +158,5 @@ PR 欢迎。建议在改 `app.py` 前先跑 `python3 -m py_compile app.py`，CI 
 
 - [Ugreen](https://www.ugreen.com/) — DH4300Plus 硬件平台
 - [Rockchip](https://www.rock-chips.com/) — MPP/RKRGA
-- [ofelia](https://github.com/mcuadros/ofelia) — Docker 内 cron
+- [Tailscale](https://tailscale.com/) — Funnel / 跨节点直连
 - ffmpeg 项目和所有 encoder maintainer

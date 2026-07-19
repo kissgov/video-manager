@@ -1,5 +1,23 @@
 // 视频压缩任务管理 - 前端逻辑
 
+// 反向代理兼容: fetch('/api/...') 在子路径 (如 /nas1/) 下会错位
+// 在顶层把 fetch 包一下, 自动加上当前页面的目录前缀
+(function(){
+  var p = location.pathname;
+  // /nas1/  →  /nas1/
+  // /        →  /
+  // /nas1    →  /
+  var base = p.substring(0, p.lastIndexOf('/') + 1) || '/';
+  if (base === '/') return; // 根路径, fetch('/api/...') 本来就对
+  var orig = window.fetch.bind(window);
+  window.fetch = function(input, init){
+    if (typeof input === 'string' && input.charAt(0) === '/') {
+      input = base + input.slice(1);
+    }
+    return orig(input, init);
+  };
+})();
+
 const $  = (s, r=document) => r.querySelector(s);
 const $$ = (s, r=document) => Array.from(r.querySelectorAll(s));
 

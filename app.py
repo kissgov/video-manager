@@ -1439,11 +1439,41 @@ class Handler(BaseHTTPRequestHandler):
         # 处理 CORS preflight
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Range, Content-Type")
         self.send_header("Access-Control-Max-Age", "86400")
         self.end_headers()
         return None
+
+    def _read_json_body(self):
+        """PATCH/DELETE/POST 共用的 body 解析"""
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if not length:
+            return {}
+        try:
+            raw = self.rfile.read(length).decode("utf-8")
+            return json.loads(raw) if raw else {}
+        except Exception:
+            return {}
+
+    def do_PATCH(self):
+        """路由 /api/cluster/peers/<id> — 以 PATCH 改 url/name"""
+        url = urlparse(self.path)
+        path = url.path
+        m = re.match(r"^/api/cluster/peers/([A-Za-z0-9_-]{1,32})/?$", path)
+        if not m:
+            return self.send_error(404)
+        data = self._read_json_body()
+        return self._handle_peer_op(m.group(1), data)
+
+    def do_DELETE(self):
+        """路由 /api/cluster/peers/<id> — 删除节点"""
+        url = urlparse(self.path)
+        path = url.path
+        m = re.match(r"^/api/cluster/peers/([A-Za-z0-9_-]{1,32})/?$", path)
+        if not m:
+            return self.send_error(404)
+        return self._handle_peer_op(m.group(1), {})
 
     def _serve_file(self, path, ctype="text/plain"):
         try:
@@ -1457,6 +1487,54 @@ class Handler(BaseHTTPRequestHandler):
         except FileNotFoundError:
             self.send_response(404)
             self.end_headers()
+
+    def _handle_peer_op(self, peer_id: str, data: dict):
+        """单节点 POST/PATCH/DELETE 路由 /api/cluster/peers/<id>
+        install.sh 在 worker 节点上 join 时调 POST
+        UI 在管理面板上 add/remove/toggle 时调 POST/PATCH/DELETE
+        """
+        method = self.command  # POST / PATCH / DELETE
+        try:
+            raw = _get_setting("cluster.peers", "[]")
+            peers = json.loads(raw) if raw else []
+        except Exception:
+            peers = []
+
+        if method == "POST":
+            url = (data.get("url") or "").strip().rstrip("/")
+            name = (data.get("name") or "").strip() or peer_id
+            if not url.startswith(("http://", "https://")):
+                return json_response(self, 400, {"ok": False, "error": "url 必须以 http:// 或 https:// 开头"})
+            if any(p.get("id") == peer_id for p in peers):
+                return json_response(self, 409, {"ok": False, "error": f"节点 {peer_id} 已存在"})
+            peers.append({"id": peer_id, "name": name, "url": url})
+            update_peers(peers)
+            log(f"集群: 添加节点 {peer_id} -> {url}")
+            return json_response(self, 200, {"ok": True, "id": peer_id, "url": url})
+
+        if method == "DELETE":
+            new_peers = [p for p in peers if p.get("id") != peer_id]
+            if len(new_peers) == len(peers):
+                return json_response(self, 404, {"ok": False, "error": f"节点 {peer_id} 不存在"})
+            update_peers(new_peers)
+            log(f"集群: 移除节点 {peer_id}")
+            return json_response(self, 200, {"ok": True})
+
+        if method == "PATCH":
+            target = next((p for p in peers if p.get("id") == peer_id), None)
+            if not target:
+                return json_response(self, 404, {"ok": False, "error": f"节点 {peer_id} 不存在"})
+            if "url" in data:
+                new_url = (data.get("url") or "").strip().rstrip("/")
+                if not new_url.startswith(("http://", "https://")):
+                    return json_response(self, 400, {"ok": False, "error": "url 必须以 http:// 或 https:// 开头"})
+                target["url"] = new_url
+            if "name" in data:
+                target["name"] = (data.get("name") or peer_id).strip()
+            update_peers(peers)
+            return json_response(self, 200, {"ok": True})
+
+        return json_response(self, 405, {"ok": False, "error": f"不支持的方法 {method}"})
 
     def do_GET(self):
         url = urlparse(self.path)
@@ -1696,6 +1774,45 @@ class Handler(BaseHTTPRequestHandler):
                 },
                 "peers": list(_cluster_cache["peers"].values()),
                 "last_refresh": _cluster_cache.get("last_refresh"),
+            })
+
+        if path == "/api/cluster/nodes":
+            # 集群管理面板用的精简视图:返回 settings 里的源数据 + 每节点最新状态
+            # 与 /api/cluster/peers 不同:不走缓存,直读 DB,客户端可立即拿到刚保存的数据
+            raw = _get_setting("cluster.peers", "[]")
+            try:
+                cfg = json.loads(raw) if raw else []
+            except Exception:
+                cfg = []
+            nodes = []
+            for p in cfg:
+                pid = p.get("id") or p.get("url")
+                cached = _cluster_cache["peers"].get(pid, {})
+                nodes.append({
+                    "id": pid,
+                    "name": p.get("name", pid),
+                    "url": p.get("url", "").rstrip("/"),
+                    "ok": cached.get("ok", False),
+                    "online": cached.get("ok", False),
+                    "last_fetched": cached.get("fetched_at"),
+                    "state": (cached.get("state") or {}),
+                })
+            return json_response(self, 200, {
+                "nodes": nodes,
+                "self": {
+                    "id": get_self_id(),
+                    "name": get_self_name(),
+                    "url": get_self_url(),
+                },
+                "source": "settings:cluster.peers",
+            })
+
+        if path == "/api/cluster/health":
+            return json_response(self, 200, {
+                "ok": True,
+                "version": "refactor/1",
+                "peers": len(_cluster_cache["peers"]),
+                "service": "video-manager",
             })
 
         if path == "/api/cluster/files":
@@ -1948,6 +2065,12 @@ class Handler(BaseHTTPRequestHandler):
                 "last_refresh": _cluster_cache.get("last_refresh"),
                 "peers": list(_cluster_cache["peers"].values()),
             })
+
+        # ===== cluster POST: 单节点增删改(给 install.sh join 用)=====
+        m_peer = re.match(r"^/api/cluster/peers/([A-Za-z0-9_-]{1,32})/?$", path)
+        if m_peer:
+            peer_id = m_peer.group(1)
+            return self._handle_peer_op(peer_id, data)
 
         # ===== 任务队列 POST =====
         if path == "/api/queue/sync":
@@ -3128,9 +3251,49 @@ def update_self(sid: str = None, sname: str = None, surl: str = None):
         _set_setting("cluster.self.url", surl.strip())
 
 # ============== main ==============
+def _migrate_legacy_peers():
+    """一次性迁移:从 /etc/caddy/peers.conf (旧部署) 读入 cluster.peers setting.
+
+    后续部署不再依赖这个文件。它存在则读,不在则跳过;已经是空列表则也跳过。
+    Idempotent: 重启不会重复导入(只在 DB 为空时导入)。
+    """
+    legacy = Path("/etc/caddy/peers.conf")
+    if not legacy.exists():
+        return
+    raw = _get_setting("cluster.peers", "[]")
+    try:
+        existing = json.loads(raw) if raw else []
+    except Exception:
+        existing = []
+    if existing:
+        return  # 已迁过,跳过
+    peer_re = re.compile(r"^([A-Za-z0-9_-]+)=(.+)$")
+    imported = []
+    try:
+        with legacy.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    stripped = line.lstrip("#").strip()
+                else:
+                    stripped = line
+                m = peer_re.match(stripped)
+                if not m:
+                    continue
+                pid, url = m.group(1).strip(), m.group(2).strip()
+                if pid and url.startswith(("http://", "https://")):
+                    imported.append({"id": pid, "name": pid, "url": url.rstrip("/")})
+    except Exception as e:
+        log(f"启动迁移读 {legacy} 失败: {e}", level=logging.WARNING)
+        return
+    if imported:
+        update_peers(imported)
+        log(f"启动迁移: 从 {legacy} 导入 {len(imported)} 个节点 -> settings:cluster.peers")
+
 def main():
     init_db()
     load_settings()
+    _migrate_legacy_peers()
     start_scheduler()
     start_cluster()
     log(f"启动: 监听 {HOST}:{PORT}")
