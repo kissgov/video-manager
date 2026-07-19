@@ -90,22 +90,25 @@ done
 
 # ---------- 提权小工具 (需要在 uninstall 之前定义) ----------
 sudo_q() {
-  # 优先 sudo -n (免密能用就走);失败后如果 shell 没有 TTY 就报清晰错误
+  # 如果设了 SUDO_PASSWORD 环境变量,优先用 (用于非 TTY 环境如 cron/ agent 调用)
+  if [[ -n "${SUDO_PASSWORD:-}" ]]; then
+    # 用 here-string 避免 pipe 跨进程 stdin 问题
+    sudo -S "$@" < <(printf '%s\n' "$SUDO_PASSWORD") 2>/dev/null
+    return $?
+  fi
+  # 不然试 sudo -n: 优先免密
   if sudo -n true 2>/dev/null; then
     sudo -n "$@"
     return $?
   fi
-  if ! [ -t 0 ] && [ -z "${SUDO_PASSWORD:-}" ]; then
+  # 没有 TTY 也 无密码 → 报清晰错误让用户补两选一
+  if ! [ -t 0 ]; then
     err "sudo 要密码,但这个 shell 没有 TTY"
     err "解决 1: sudo bash contrib/install-sudoers.sh   (装一次,以后免密)"
     err "解决 2: SUDO_PASSWORD=你的密码 bash $0 $*"
     exit 1
   fi
-  if [ -n "${SUDO_PASSWORD:-}" ]; then
-    echo "$SUDO_PASSWORD" | sudo -S "$@" 2>/dev/null
-  else
-    sudo "$@"
-  fi
+  sudo "$@"
 }
 
 # ---------- sudoers 规则检查 ----------
