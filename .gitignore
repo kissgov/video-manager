@@ -34,3 +34,11 @@ Thumbs.db
 .env
 .env.local
 secrets/
+
+# Node / 前端构建依赖
+node_modules/
+# 注意：static/dist/ 是构建产物，但为了部署免 node 仍然入库，故不忽略
+# TypeScript 增量构建缓存 / tsc 误产出的 vite.config.js 等不入库
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
