@@ -40,6 +40,7 @@ from .stats import get_stats, get_history
 from .ffmpeg import (
     ffmpeg_version, detect_hwaccel_hint,
     _get_rkmpp_qp, _get_rkmpp_bitrate_cap, _get_force_recompress,
+    _get_keep_audio, _get_audio_bitrate_k,
 )
 from .ofelia import (
     read_script_config, update_script_config,
@@ -815,6 +816,8 @@ class Handler(BaseHTTPRequestHandler):
                 "qp":               _get_rkmpp_qp(),
                 "bitrate_cap":      _get_rkmpp_bitrate_cap(),
                 "force_recompress": _get_force_recompress(),
+                "keep_audio":       _get_keep_audio(),
+                "audio_bitrate_k":  _get_audio_bitrate_k(),
             })
 
         if path == "/api/settings":
@@ -1051,6 +1054,15 @@ class Handler(BaseHTTPRequestHandler):
                 v = bool(data.get("force_recompress"))
                 _set_setting("force_recompress", "1" if v else "0")
                 note.append("强制重压=ON" if v else "强制重压=OFF")
+            if "keep_audio" in data:
+                v = bool(data.get("keep_audio"))
+                _set_setting("keep_audio", "1" if v else "0")
+                note.append("保留音频=ON" if v else "保留音频=OFF")
+            if "audio_bitrate_k" in data:
+                br = int(data.get("audio_bitrate_k", 96))
+                br = max(32, min(192, br))
+                _set_setting("audio_bitrate_k", str(br))
+                note.append(f"音频码率={br}kbps")
             return json_response(self, 200, {"ok": True, "note": " · ".join(note) or "无变更"})
 
         if path == "/api/service/restart":

@@ -24,6 +24,9 @@ interface PbFile {
   isSelf: boolean
 }
 
+const VOL_KEY = 'pb:vol'
+const MUTED_KEY = 'pb:muted'
+
 export default function PlaybackPage() {
   const { message } = App.useApp()
   const [pbDir, setPbDir] = useState<'output' | 'input' | 'all'>('output')
@@ -35,6 +38,9 @@ export default function PlaybackPage() {
   const [autoNextDay, setAutoNextDay] = useState(false)
   const [peerFilter, setPeerFilter] = useState<string>('')
   const [loading, setLoading] = useState(false)
+  const [muted, setMuted] = useState<boolean>(() => {
+    try { return localStorage.getItem(MUTED_KEY) === '1' } catch { return false }
+  })
   const [progress, setProgress] = useState('—')
   const [counter, setCounter] = useState('0 / 0')
   const [nextHint, setNextHint] = useState('下一个: —')
@@ -67,8 +73,25 @@ export default function PlaybackPage() {
   autoNextDayRef.current = autoNextDay
   const peerFilterRef = useRef(peerFilter)
   peerFilterRef.current = peerFilter
+  const mutedRef = useRef(muted)
+  mutedRef.current = muted
   const thumbsDataRef = useRef(thumbsData)
   thumbsDataRef.current = thumbsData
+
+  // 同步用户的静音/音量：每次播放前写入到 video.muted/volume + 持久化
+  const persistMuted = useCallback((m: boolean) => {
+    setMuted(m)
+    mutedRef.current = m
+    try { localStorage.setItem(MUTED_KEY, m ? '1' : '0') } catch {}
+    const v = playerRef.current
+    if (v) v.muted = m
+  }, [])
+  const persistVol = useCallback((vol: number) => {
+    const c = Math.max(0, Math.min(1, vol))
+    try { localStorage.setItem(VOL_KEY, String(c)) } catch {}
+    const v = playerRef.current
+    if (v) v.volume = c
+  }, [])
 
   // ---- 加载事件列表(本机 + 所有 peer)----
   const loadList = useCallback(async () => {
@@ -230,10 +253,30 @@ export default function PlaybackPage() {
       const f = filesRef.current[idx]
       const v = playerRef.current
       if (v) {
+        // 恢复音量/静音(用户偏好)
+        try {
+          const stored = localStorage.getItem(VOL_KEY)
+          if (stored) {
+            const n = parseFloat(stored)
+            if (isFinite(n)) v.volume = Math.max(0, Math.min(1, n))
+          }
+        } catch {}
+        v.muted = mutedRef.current
         v.src = f.streamUrl
         v.load()
         const p = v.play()
-        if (p) p.catch(() => {})
+        if (p) {
+          p.catch((err) => {
+            // 浏览器 autoplay 策略:带声播放被拒 -> 临时静音重试,提示用户点🔊解锁
+            if (err && (err.name === 'NotAllowedError' || /autoplay/i.test(err.message || ''))) {
+              if (!v.muted) {
+                v.muted = true
+                v.play().catch(() => {})
+                message.info('🔇 浏览器策略阻止带声自动播放，已静音；点击🔊开启声音')
+              }
+            }
+          })
+        }
       }
       loadThumbs(f)
       const startT = f.meta ? f.meta.start : f.mtime
@@ -251,7 +294,7 @@ export default function PlaybackPage() {
         setNextHint(loopRef.current ? '下一个 (→): 循环到第一个' : '已是最后一段')
       }
     },
-    [loadThumbs]
+    [loadThumbs, message]
   )
 
   // 判断文件是否通过当前节点筛选(无筛选时全部通过)
@@ -557,6 +600,21 @@ export default function PlaybackPage() {
           </span>
           <Text style={{ color: '#94a3b8', fontSize: 12, whiteSpace: 'nowrap' }}>{curInfo}</Text>
           <Space size={4}>
+            <Button
+              size="small"
+              onClick={() => {
+                const nextMuted = !mutedRef.current
+                persistMuted(nextMuted)
+                if (!nextMuted) {
+                  // 用户点击后可以解除浏览器策略的临时静音
+                  const v = playerRef.current
+                  if (v && v.paused) v.play().catch(() => {})
+                }
+              }}
+              title={muted ? '取消静音' : '静音'}
+            >
+              {muted ? '🔇 静音' : '🔊 有声'}
+            </Button>
             <Button size="small" onClick={prev}>⏮ 上一段</Button>
             <Button size="small" onClick={next}>下一段 ⏭</Button>
             <Button size="small" onClick={replay}>↻ 重播</Button>

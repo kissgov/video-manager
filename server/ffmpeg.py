@@ -47,6 +47,17 @@ def _get_force_recompress() -> bool:
     """UI 开关：on 时重新压缩所有 input(覆盖旧 output)。"""
     return _get_setting_bool("force_recompress", False)
 
+def _get_keep_audio() -> bool:
+    """是否保留音频。默认 True：监控录像大多带声，浏览器播放 AAC 兼容无门槛。
+    关了可省 8-15% 空间，但回放无声。
+    """
+    return _get_setting_bool("keep_audio", True)
+
+def _get_audio_bitrate_k() -> int:
+    """音频码率(kbps),默认 96(人声/监控足够),范围 32-192。"""
+    v = _get_setting_int("audio_bitrate_k", 96)
+    return max(32, min(192, v))
+
 def _resolve_ffmpeg_bin() -> str:
     for path in [
         "/usr/local/bin/ffmpeg-rkmpp",
@@ -146,16 +157,14 @@ def _build_ffmpeg_cmd(input_file: Path, output_file: Path, hwaccel: str, ffmpeg_
     base = ["nice", "-n", str(_NICE_LEVEL),
             ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error",
             "-err_detect", "ignore_err", "-fflags", "+discardcorrupt"]
+    # 音频处理：默认保留，转 AAC(浏览器全兼容)，码率可配置。不想占空间可关 keep_audio 走 -an
+    if _get_keep_audio():
+        audio_args = ["-c:a", "aac", "-b:a", f"{_get_audio_bitrate_k()}k", "-ac", "1"]  # 监控用单声道即可，再省一半音频空间
+    else:
+        audio_args = ["-an"]
+    # -movflags +faststart 将 moov atom 移到文件头,浏览器边下边播
+    common_tail = audio_args + ["-movflags", "+faststart", "-y", str(output_file)]
     if hwaccel == "rkmpp":
-        # RKMPP 优化管线:硬件解码(drm_prime 零拷贝) → RGA 硬缩 → MPP 硬编
-        # 实测 RK3588: 12x+ 实时（软缩放只能 2x）
-        # 只设 vpp_rkrga 缩放,framerate 不强制(source 通常 20fps,压缩比够好)
-        # 加 format/fps 会造成 auto_scale_0 格式不兼容
-        # 码率控制:CQP(变码率,跟着内容复杂度走)
-        #   - 静态场景(监控大多数时候)自动低码率,文件变小
-        #   - 动态场景(有人动)保持质量
-        #   - -b:v 作为上限防意外(动态场景不会跳到 100MB)
-        #   - QP 和 cap 都可以在 配置 页调
         qp = _get_rkmpp_qp()
         cap = _get_rkmpp_bitrate_cap()
         cmd = [
@@ -168,8 +177,7 @@ def _build_ffmpeg_cmd(input_file: Path, output_file: Path, hwaccel: str, ffmpeg_
         ]
         if cap > 0:
             cmd += ["-b:v", f"{cap}k"]
-        cmd += ["-an", "-movflags", "+faststart", "-y", str(output_file)]
-        return base + cmd
+        return base + cmd + common_tail
     if hwaccel == "vaapi":
         return base + [
             "-hwaccel", "vaapi", "-hwaccel_device", "/dev/dri/renderD128",
@@ -177,24 +185,21 @@ def _build_ffmpeg_cmd(input_file: Path, output_file: Path, hwaccel: str, ffmpeg_
             "-i", str(input_file),
             "-vf", f"format=nv12|vaapi,hwupload,scale_vaapi=-2:{_OUTPUT_HEIGHT}:format=nv12,framerate=fps={_OUTPUT_FPS}",
             "-c:v", "hevc_vaapi", "-qp", str(_VAAPI_QP),
-            "-an", "-movflags", "+faststart", "-y", str(output_file),
-        ]
+        ] + common_tail
     if hwaccel == "v4l2m2m":
         return base + [
             "-i", str(input_file),
             "-vf", f"scale=-2:{_OUTPUT_HEIGHT},fps={_OUTPUT_FPS}",
             "-c:v", "hevc_v4l2m2m", "-num_capture_buffers", "32",
             "-b:v", "1M", "-maxrate", "1.5M", "-bufsize", "2M",
-            "-an", "-movflags", "+faststart", "-y", str(output_file),
-        ]
+        ] + common_tail
     if hwaccel == "qsv":
         return base + [
             "-hwaccel", "qsv", "-c:v", "h264_qsv",
             "-i", str(input_file),
             "-vf", f"scale_qsv=-2:{_OUTPUT_HEIGHT},vpp_qsv=framerate={_OUTPUT_FPS}",
             "-c:v", "hevc_qsv", "-global_quality", str(_VAAPI_QP), "-preset", "medium",
-            "-an", "-movflags", "+faststart", "-y", str(output_file),
-        ]
+        ] + common_tail
     # soft
     return base + [
         "-threads", "0",
@@ -202,8 +207,7 @@ def _build_ffmpeg_cmd(input_file: Path, output_file: Path, hwaccel: str, ffmpeg_
         "-vf", f"scale=-2:{_OUTPUT_HEIGHT},fps={_OUTPUT_FPS}",
         "-c:v", _SOFT_CODEC, "-crf", str(_SOFT_CRF), "-preset", _SOFT_PRESET,
         "-tune", "fastdecode",
-        "-an", "-movflags", "+faststart", "-y", str(output_file),
-    ]
+    ] + common_tail
 
 def _run_ffmpeg(input_file: Path, output_file: Path, hwaccel: str) -> tuple:
     """跑一个文件,返回 (exit_code, stderr_text)。"""
