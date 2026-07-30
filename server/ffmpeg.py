@@ -17,6 +17,22 @@ from .db import _get_setting_int, _get_setting_bool
 from .state import _state_lock, _S
 
 
+# jellyfin-ffmpeg 自带 .so(librockchip_mpp 等)在 /usr/lib/jellyfin-ffmpeg/,
+# 默认 ldconfig 搜不到,每次起 ffmpeg 子进程时注入 LD_LIBRARY_PATH,否则:
+# - -hide_banner 阶段初始化失败直接退 → 探测不到编码器 → 误判软编
+# - worker 里跑压片也会同样崩
+def _ffmpeg_env() -> dict:
+    extra = "/usr/lib/jellyfin-ffmpeg"
+    env = os.environ.copy()
+    cur = env.get("LD_LIBRARY_PATH", "")
+    if cur:
+        if extra not in cur.split(":"):
+            env["LD_LIBRARY_PATH"] = f"{extra}:{cur}"
+    else:
+        env["LD_LIBRARY_PATH"] = extra
+    return env
+
+
 def _get_rkmpp_qp() -> int:
     """从 settings 读 RKMPP QP,默认 28。范围 18-36。"""
     v = _get_setting_int("rkmpp_qp", 28)
@@ -51,6 +67,7 @@ def _probe_encoders(ffmpeg_bin: str) -> str:
         r = subprocess.run(
             [ffmpeg_bin, "-hide_banner", "-encoders"],
             capture_output=True, text=True, timeout=10,
+            env=_ffmpeg_env(),
         )
         return r.stdout
     except Exception as e:
@@ -72,7 +89,7 @@ def _probe_hwaccel_ok(ffmpeg_bin: str, mode: str) -> bool:
     else:
         return False
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=30)
+        r = subprocess.run(cmd, capture_output=True, timeout=30, env=_ffmpeg_env())
         return r.returncode == 0
     except Exception:
         return False
@@ -112,6 +129,7 @@ def _detect_hwaccel() -> str:
                     [ffmpeg_bin, "-hide_banner", "-f", "v4l2",
                      "-list_formats", "all", "-i", dev],
                     capture_output=True, text=True, timeout=10,
+                    env=_ffmpeg_env(),
                 )
                 if "HEVC" in (pr.stdout + pr.stderr):
                     return "v4l2m2m"
@@ -193,7 +211,10 @@ def _run_ffmpeg(input_file: Path, output_file: Path, hwaccel: str) -> tuple:
     cmd = _build_ffmpeg_cmd(input_file, output_file, hwaccel, ffmpeg_bin)
     proc = None
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            env=_ffmpeg_env(),
+        )
         with _state_lock:
             _S.ffmpeg_proc = proc
         try:
@@ -229,7 +250,8 @@ def ffmpeg_version():
                  "/ugreen/@appstore/com.ugreen.transcode/lib/ffmpeg", "/usr/local/bin/ffmpeg"]:
         if os.path.exists(cand) and os.access(cand, os.X_OK):
             try:
-                r = subprocess.run([cand, "-version"], capture_output=True, text=True, timeout=5)
+                r = subprocess.run([cand, "-version"], capture_output=True, text=True, timeout=5,
+                                   env=_ffmpeg_env())
                 return cand, r.stdout.splitlines()[0] if r.stdout else "(empty)"
             except Exception:
                 return cand, "(运行失败)"

@@ -68,11 +68,24 @@ log "已装到 $INSTALL_PATH"
 
 # ---------- 验证 ----------
 log "验证 RKMPP 编器..."
-if "$INSTALL_PATH" -hide_banner -encoders 2>/dev/null | grep -qE "h264_rkmpp|hevc_rkmpp"; then
+# jellyfin-ffmpeg 的二进制动态链接到 /usr/lib/jellyfin-ffmpeg/ 下自己的 .so,
+# 如果只 cp 二进制没带 LD_LIBRARY_PATH,-hide_banner 会初始化失败并退(连 encoders stdout 都没)。
+# 这里用 LD_LIBRARY_PATH 强制找 jellyfin-ffmpeg 自带 lib,同时去掉 -hide_banner 防早期库报错。
+export LD_LIBRARY_PATH="/usr/lib/jellyfin-ffmpeg:${LD_LIBRARY_PATH:-}"
+JFMPEG_OUT=$("$INSTALL_PATH" -encoders 2>&1)
+if echo "$JFMPEG_OUT" | grep -qE "h264_rkmpp|hevc_rkmpp"; then
     log "✅ RKMPP 编器可用"
 else
-    log "❌ 没有 RKMPP 编器,检查二进制"
+    log "❌ 没有 RKMPP 编器,检查二进制 / LD_LIBRARY_PATH"
+    log "   ffmpeg 输出(前 10 行):"
+    echo "$JFMPEG_OUT" | head -10 | sed 's/^/     /'
     exit 1
+fi
+# 为了让 systemd / 非交互 shell 也能找到 jellyfin-ffmpeg 自带 .so,写 ld.so.conf.d 兜底
+if [ ! -f /etc/ld.so.conf.d/jellyfin-ffmpeg.conf ]; then
+    echo "/usr/lib/jellyfin-ffmpeg" > /etc/ld.so.conf.d/jellyfin-ffmpeg.conf
+    ldconfig
+    log "已写 /etc/ld.so.conf.d/jellyfin-ffmpeg.conf + ldconfig (fim 运行时不用再带 LD_LIBRARY_PATH)"
 fi
 
 # ---------- 设备权限 ----------
