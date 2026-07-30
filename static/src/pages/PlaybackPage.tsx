@@ -30,7 +30,7 @@ const MUTED_KEY = 'pb:muted'
 
 export default function PlaybackPage() {
   const { message } = App.useApp()
-  const [pbDir, setPbDir] = useState<'output' | 'input' | 'all'>('output')
+  const [pbDir, setPbDir] = useState<'output' | 'input' | 'all'>('all')
   const [date, setDate] = useState<string>('') // YYYY-MM-DD
   const [files, setFiles] = useState<PbFile[]>([])
   const [index, setIndex] = useState(-1)
@@ -49,16 +49,7 @@ export default function PlaybackPage() {
   const [curInfo, setCurInfo] = useState('')
   const [diagnosis, setDiagnosis] = useState<{ html: string; warn?: boolean; err?: boolean }>({ html: '' })
 
-  // 缩略图
-  const [thumbsEnabled, setThumbsEnabled] = useState(true)
-  const [thumbsData, setThumbsData] = useState<{ duration: number; thumbs: { i: number; t: number; url: string }[] } | null>(null)
-  const [thumbsStatus, setThumbsStatus] = useState('')
-  const [thumbsLoading, setThumbsLoading] = useState(false)
-
   const playerRef = useRef<HTMLVideoElement>(null)
-  const stripRef = useRef<HTMLDivElement>(null)
-  const thumbsReqRef = useRef(0)
-  const thumbsFileRef = useRef<string | null>(null)
   const indexRef = useRef(-1)
   indexRef.current = index
   const filesRef = useRef<PbFile[]>([])
@@ -77,8 +68,6 @@ export default function PlaybackPage() {
   peerFilterRef.current = peerFilter
   const mutedRef = useRef(muted)
   mutedRef.current = muted
-  const thumbsDataRef = useRef(thumbsData)
-  thumbsDataRef.current = thumbsData
 
   // 同步用户的静音/音量：每次播放前写入到 video.muted/volume + 持久化
   const persistMuted = useCallback((m: boolean) => {
@@ -186,6 +175,23 @@ export default function PlaybackPage() {
     return () => { cancelled = true; if (to !== null) window.clearTimeout(to) }
   }, [index, onVideoLoadedMeta])
 
+  // ---- 首次打开:默认本机节点 + 最新有视频的日期 ----
+  const defaultedRef = useRef(false)
+  useEffect(() => {
+    if (defaultedRef.current) return
+    defaultedRef.current = true
+    // 1) 取本机节点 id,设为 peerFilter 默认(避免跨节点拉取,加载更快)
+    api<any>('/api/cluster/peers', { silent: true }).then((r) => {
+      if (r?.self?.id) setPeerFilter(r.self.id)
+    }).catch(() => {})
+    // 2) 取 output 目录里有视频的日期列表,用最新一个(日期降序取 dates[-1] 或 dates[0]? dates 是升序所以取最后一个)
+    api<any>('/api/files/dates?dir=output', { silent: true }).then((r) => {
+      const dates: string[] = (r?.dates || []).slice().sort()
+      if (dates.length > 0) setDate(dates[dates.length - 1])
+    }).catch(() => {})
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   // ---- 加载事件列表(本机 + 所有 peer)----
   const loadList = useCallback(async () => {
     setLoading(true)
@@ -255,8 +261,6 @@ export default function PlaybackPage() {
       })
       setFiles(out)
       setIndex(-1)
-      setThumbsData(null)
-      thumbsFileRef.current = null
     } catch (e: any) {
       message.error('加载失败: ' + e.message)
     } finally {
@@ -301,43 +305,6 @@ export default function PlaybackPage() {
     groups[dt].push(entry)
   })
 
-  // ---- 加载缩略图 ----
-  const loadThumbs = useCallback(async (file: PbFile) => {
-    if (!thumbsEnabled) {
-      setThumbsData(null)
-      setThumbsStatus('')
-      return
-    }
-    const fileKey = `${file.peerId}|${file.dir}|${file.path}`
-    if (thumbsFileRef.current === fileKey && thumbsDataRef.current) return
-    thumbsReqRef.current++
-    const myReq = thumbsReqRef.current
-    thumbsFileRef.current = fileKey
-    setThumbsData(null)
-    setThumbsLoading(true)
-    setThumbsStatus('正在提取缩略图...')
-    const dir = file.dir || pbDirRef.current || 'output'
-    // peer 文件走本地代理转发,避免直连 peer 造成 Mixed Content / CORS
-    const thumbsUrl = file.isSelf
-      ? `/api/pb/thumbs?dir=${encodeURIComponent(dir)}&path=${encodeURIComponent(file.path)}&count=24`
-      : `/api/cluster/pb/thumbs?peer=${encodeURIComponent(file.peerId)}&dir=${encodeURIComponent(dir)}&path=${encodeURIComponent(file.path)}&count=24`
-    try {
-      const r = await api<any>(thumbsUrl, { silent: true })
-      if (myReq !== thumbsReqRef.current) return
-      if (r.error) {
-        setThumbsStatus('缩略图提取失败: ' + r.error)
-        return
-      }
-      setThumbsData(r)
-      setThumbsStatus(`${(r.thumbs || []).length} 帧 / 总时长 ${pbFmtDur(r.duration)}`)
-    } catch (e: any) {
-      if (myReq !== thumbsReqRef.current) return
-      setThumbsStatus('缩略图加载失败: ' + e.message)
-    } finally {
-      if (myReq === thumbsReqRef.current) setThumbsLoading(false)
-    }
-  }, [thumbsEnabled])
-
   // ---- 播放 ----
   const play = useCallback(
     (idx: number) => {
@@ -372,7 +339,6 @@ export default function PlaybackPage() {
           })
         }
       }
-      loadThumbs(f)
       const startT = f.meta ? f.meta.start : f.mtime
       const endT = f.meta ? f.meta.end : ''
       setCurTitle(f.path)
@@ -388,7 +354,7 @@ export default function PlaybackPage() {
         setNextHint(loopRef.current ? '下一个 (→): 循环到第一个' : '已是最后一段')
       }
     },
-    [loadThumbs, message]
+    [message]
   )
 
   // 判断文件是否通过当前节点筛选(无筛选时全部通过)
@@ -484,8 +450,6 @@ export default function PlaybackPage() {
         const pct = ((v.currentTime / v.duration) * 100).toFixed(1)
         setProgress(`${pbFmtDur(v.currentTime)} / ${pbFmtDur(v.duration)} (${pct}%)`)
       }
-      // 同步播放头
-      updatePlayhead()
     }
     const onError = () => {
       const err = v.error
@@ -503,36 +467,55 @@ export default function PlaybackPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [next])
 
-  function updatePlayhead() {
-    const strip = stripRef.current
-    const v = playerRef.current
-    if (!strip || !v || !thumbsDataRef.current) return
-    const head = strip.querySelector('.pb-thumb-playhead') as HTMLDivElement | null
-    if (!head) return
-    const t = v.currentTime || 0
-    const dur = thumbsDataRef.current.duration || v.duration || 0
-    if (dur <= 0) {
-      head.style.display = 'none'
-      return
+  // ---- 列表缩略图懒加载(进入视口或 hover 才触发 /api/*/thumb ffmpeg 抽帧,避免首屏 N 个并发阻塞视频 IO)----
+  const thumbObserverRef = useRef<IntersectionObserver | null>(null)
+  useEffect(() => {
+    // 单例 IntersectionObserver
+    if (!thumbObserverRef.current) {
+      try {
+        thumbObserverRef.current = new IntersectionObserver(
+          (entries) => {
+            for (const e of entries) {
+              const el = e.target as HTMLImageElement
+              if (e.isIntersecting) {
+                // 进入视口:再等 80ms stable(快速滚动就不触发抽帧)
+                const ds = el as any
+                if (ds.__pbThumbT) clearTimeout(ds.__pbThumbT)
+                ds.__pbThumbT = window.setTimeout(() => {
+                  const u = el.getAttribute('data-thumb-src')
+                  if (u && el.getAttribute('src') !== u) {
+                    el.setAttribute('src', u)
+                    el.style.background = ''
+                  }
+                }, 80)
+              } else {
+                const ds = el as any
+                if (ds.__pbThumbT) { clearTimeout(ds.__pbThumbT); ds.__pbThumbT = 0 }
+              }
+            }
+          },
+          { root: null, rootMargin: '80px 0px', threshold: 0.01 }
+        )
+      } catch {
+        thumbObserverRef.current = null
+      }
     }
-    const pct = Math.max(0, Math.min(1, t / dur))
-    head.style.display = 'block'
-    head.style.left = `calc(${pct * 100}%)`
-    // 高亮当前 thumb
-    const thumbs = thumbsDataRef.current.thumbs
-    const closest = thumbs.reduce((a, b) => (Math.abs(b.t - t) < Math.abs(a.t - t) ? b : a))
-    strip.querySelectorAll('.pb-thumb.pb-thumb-current').forEach((el) => el.classList.remove('pb-thumb-current'))
-    const curEl = strip.querySelector(`.pb-thumb[data-i="${closest.i}"]`)
-    if (curEl) curEl.classList.add('pb-thumb-current')
-  }
-
-  function seekToThumb(t: number) {
-    const v = playerRef.current
-    if (v && isFinite(t)) {
-      v.currentTime = t
-      updatePlayhead()
+    // observe 所有带 data-thumb-src 且未加载的 img
+    const imgs = document.querySelectorAll<HTMLImageElement>('img[data-thumb-src]')
+    imgs.forEach((el) => {
+      if (el.getAttribute('data-thumb-obs') === '1') return
+      el.setAttribute('data-thumb-obs', '1')
+      // hover:立即触发
+      el.addEventListener?.('mouseenter', () => {
+        const u = el.getAttribute('data-thumb-src')
+        if (u && el.getAttribute('src') !== u) { el.setAttribute('src', u); el.style.background = '' }
+      })
+      thumbObserverRef.current?.observe(el)
+    })
+    return () => {
+      // 组件每次 render 后 files 变了都重新 observe,这里不 disconnect,保持单例复用
     }
-  }
+  })
 
   // ---- 键盘快捷键 ----
   useEffect(() => {
@@ -653,13 +636,29 @@ export default function PlaybackPage() {
                           }}
                         >
                           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                            <img
-                              src={f.thumbUrl}
-                              loading="lazy"
-                              style={{ width: 80, height: 48, objectFit: 'cover', borderRadius: 4, background: '#e2e8f0', flexShrink: 0 }}
-                              onError={(e) => ((e.target as HTMLImageElement).style.visibility = 'hidden')}
-                              alt=""
-                            />
+                            {(() => {
+                              // 按时间字符串 hash 出一个稳定的占位渐变(不发任何 HTTP,不调用 ffmpeg)
+                              const seed = ((f.meta?.start || f.path || '').split('').reduce((a, c) => a + c.charCodeAt(0), 0)) & 0xfff
+                              const c1 = `hsl(${seed % 360}, 30%, 22%)`
+                              const c2 = `hsl(${(seed * 7) % 360}, 40%, 12%)`
+                              return (
+                                <img
+                                  data-thumb-src={f.thumbUrl}
+                                  loading="lazy"
+                                  style={{
+                                    width: 80, height: 48, objectFit: 'cover', borderRadius: 4, flexShrink: 0,
+                                    border: 'none', display: 'block',
+                                    background: `linear-gradient(135deg, ${c1}, ${c2})`,
+                                  }}
+                                  onError={(e) => {
+                                    const t = e.currentTarget as HTMLImageElement
+                                    t.removeAttribute('src')
+                                    t.style.visibility = 'visible'
+                                  }}
+                                  alt=""
+                                />
+                              )
+                            })()}
                             <div style={{ flex: 1, minWidth: 0 }}>
                               <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
                                 <span>{isCur ? '▶' : '🎬'}</span>
@@ -743,47 +742,6 @@ export default function PlaybackPage() {
             dangerouslySetInnerHTML={{ __html: diagnosis.html }}
           />
         ) : null}
-        {/* 缩略图进度条 */}
-        <div style={{ padding: 8, borderTop: '1px solid #334155' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
-            <span style={{ fontSize: 12, color: '#94a3b8' }}>🖼 缩略图进度</span>
-            <span style={{ fontSize: 12, color: '#64748b' }}>{thumbsStatus}</span>
-            <Checkbox style={{ marginLeft: 'auto', color: '#94a3b8' }} checked={thumbsEnabled} onChange={(e) => setThumbsEnabled(e.target.checked)}>
-              <span style={{ color: '#94a3b8' }}>启用</span>
-            </Checkbox>
-          </div>
-          <div
-            ref={stripRef}
-            style={{ position: 'relative', overflowX: 'auto', overflowY: 'hidden', background: '#0f172a', borderRadius: 4, padding: 4, height: 72, whiteSpace: 'nowrap' }}
-          >
-            {!thumbsEnabled ? (
-              <div style={{ textAlign: 'center', fontSize: 12, color: '#64748b', padding: 24 }}>已禁用缩略图进度</div>
-            ) : thumbsLoading ? (
-              <div style={{ textAlign: 'center', fontSize: 12, color: '#64748b', padding: 24 }}>正在提取缩略图...</div>
-            ) : !thumbsData ? (
-              <div style={{ textAlign: 'center', fontSize: 12, color: '#64748b', padding: 24 }}>选择左侧视频后加载缩略图</div>
-            ) : !thumbsData.thumbs || thumbsData.thumbs.length === 0 ? (
-              <div style={{ textAlign: 'center', fontSize: 12, color: '#64748b', padding: 24 }}>无法获取缩略图(可能是 0 时长视频)</div>
-            ) : (
-              <>
-                {thumbsData.thumbs.map((thumb) => (
-                  <img
-                    key={thumb.i}
-                    className="pb-thumb pb-thumb-loading"
-                    data-i={thumb.i}
-                    data-t={thumb.t}
-                    src={thumb.url}
-                    alt={`${thumb.t.toFixed(1)}s`}
-                    title={pbFmtDur(thumb.t)}
-                    onLoad={(e) => e.currentTarget.classList.remove('pb-thumb-loading')}
-                    onClick={() => seekToThumb(thumb.t)}
-                  />
-                ))}
-                <div className="pb-thumb-playhead" style={{ display: 'none' }} />
-              </>
-            )}
-          </div>
-        </div>
         <div style={{ padding: 8, borderTop: '1px solid #334155', display: 'flex', alignItems: 'center', gap: 12, fontSize: 12, flexWrap: 'wrap' }}>
           <span style={{ color: '#cbd5e1' }}>{counter}</span>
           <span style={{ color: '#64748b' }}>|</span>

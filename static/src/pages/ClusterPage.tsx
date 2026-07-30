@@ -194,16 +194,16 @@ export default function ClusterPage() {
     return cfOrder === 'asc' ? <span style={{ color: '#1677ff', marginLeft: 4 }}>↑</span> : <span style={{ color: '#1677ff', marginLeft: 4 }}>↓</span>
   }
 
-  function streamUrlFor(peer: PeerFiles, path: string) {
-    if (peer.id && peer.url) {
-      // peer 节点：通过本节点代理
+  function streamUrlFor(peer: PeerFiles, path: string, selfFlag?: boolean) {
+    if (!selfFlag && peer.id && peer.url) {
+      // 远端 peer 节点:通过本节点代理
       return apiUrl(`/api/cluster/stream?peer=${encodeURIComponent(peer.id)}&dir=${cfDir}&path=${encodeURIComponent(path)}`)
     }
-    // 本机
+    // 本机(显式标记或与 self.id 匹配时)直接走本机接口,避免无意义 proxy
     return apiUrl(`/api/files/stream?dir=${cfDir}&path=${encodeURIComponent(path)}`)
   }
-  function downloadUrlFor(peer: PeerFiles, path: string) {
-    if (peer.id && peer.url) {
+  function downloadUrlFor(peer: PeerFiles, path: string, selfFlag?: boolean) {
+    if (!selfFlag && peer.id && peer.url) {
       return apiUrl(`/api/cluster/download?peer=${encodeURIComponent(peer.id)}&dir=${cfDir}&path=${encodeURIComponent(path)}`)
     }
     return apiUrl(`/api/files/download?dir=${cfDir}&path=${encodeURIComponent(path)}`)
@@ -267,16 +267,16 @@ export default function ClusterPage() {
   }
 
   // 集群文件 peer 卡片
-  function PeerFilesCard({ p }: { p: PeerFiles }) {
+  function PeerFilesCard({ p, isSelf }: { p: PeerFiles; isSelf?: boolean }) {
     const name = p.name || p.id || 'unknown'
-    const isSelf = !p.id || !p.url
+    const selfIsThis = Boolean(isSelf) || (self.id && p.id && self.id === p.id)
     if (!p.ok) {
       return (
         <Card size="small" style={{ borderColor: '#fca5a5' }}>
           <Space>
             <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: '#ef4444' }} />
             <Text strong>{name}</Text>
-            {isSelf && <Tag color="blue">本机</Tag>}
+            {selfIsThis && <Tag color="blue">本机</Tag>}
           </Space>
           <div style={{ fontSize: 12, color: '#ef4444', marginTop: 4 }}>不可达: {p.error || ''}</div>
         </Card>
