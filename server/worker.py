@@ -27,7 +27,11 @@ from .config import (
 )
 from .state import _state_lock, _stop_event, _current_file_lock, _S
 from .db import db, _db_lock
-from .ffmpeg import _resolve_ffmpeg_bin, _detect_hwaccel, _run_ffmpeg, _get_force_recompress
+from .ffmpeg import (
+    _resolve_ffmpeg_bin, _detect_hwaccel, _run_ffmpeg,
+    _get_force_recompress, _probe_has_audio,
+    _get_recompress_no_audio, _get_keep_audio,
+)
 from .files import human_size
 from .queue import sync_tasks_from_input
 
@@ -312,17 +316,25 @@ def _run_loop(run_id: int, trigger: str):
             with _state_lock:
                 _S.current_file = rel
 
-            # 输出已存在 -> 跳过(除非用户开了 force_recompress 重压开关)
-            if output_file.exists() and not _get_force_recompress():
+            # 输出已存在 -> 跳过(除非用户开了 force_recompress 重压开关,或需要补无音轨)
+            need_delete_old = False
+            if output_file.exists() and _get_force_recompress():
+                need_delete_old = True
+            elif output_file.exists() and _get_keep_audio() and _get_recompress_no_audio():
+                # 温和补压:output 已存在但没有音频轨(旧版 -an 压出的历史产物),补压一次
+                probe = _probe_has_audio(output_file)
+                if probe is False:
+                    need_delete_old = True
+                    log(f"[{i}/{len(pending)}] 补压无音轨: {rel} (output 存在但未检测到音频)")
+            if output_file.exists() and not need_delete_old:
                 _set_task_status(tid, "skipped", ended_at=now_str())
                 skipped += 1
                 log(f"[{i}/{len(pending)}] 跳过: {rel} (输出已存在)")
                 continue
-            if output_file.exists() and _get_force_recompress():
-                # 强制重压:删旧 output
+            if need_delete_old and output_file.exists():
                 try:
                     output_file.unlink()
-                    log(f"[{i}/{len(pending)}] 强制重压: 删旧 {rel}")
+                    log(f"[{i}/{len(pending)}] 重压: 删旧 {rel}")
                 except OSError as e:
                     log(f"  警告: 删旧 output 失败: {e}", level=logging.WARNING)
 

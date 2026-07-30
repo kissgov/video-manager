@@ -40,7 +40,8 @@ from .stats import get_stats, get_history
 from .ffmpeg import (
     ffmpeg_version, detect_hwaccel_hint,
     _get_rkmpp_qp, _get_rkmpp_bitrate_cap, _get_force_recompress,
-    _get_keep_audio, _get_audio_bitrate_k,
+    _get_keep_audio, _get_audio_bitrate_k, _get_recompress_no_audio,
+    _probe_has_audio,
 )
 from .ofelia import (
     read_script_config, update_script_config,
@@ -767,7 +768,7 @@ class Handler(BaseHTTPRequestHandler):
             dir_param = qs.get("dir", ["output"])[0]
             file_param = qs.get("path", [""])[0]
             base = config.INPUT_DIR if dir_param == "input" else config.OUTPUT_DIR
-            fp = _safe_join(base, file_param)
+            fp = self._safe_join(base, file_param)
             if not fp or not fp.is_file():
                 return json_response(self, 404, {"ok": False, "error": "not found"})
             st = fp.stat()
@@ -776,6 +777,34 @@ class Handler(BaseHTTPRequestHandler):
                 "mtime": int(st.st_mtime),
                 "mtime_h": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)),
             })
+
+        # ---- 音轨探测(前端诊断:为什么原生音量按钮是灰色)----
+        if path == "/api/files/has-audio":
+            dir_param = qs.get("dir", ["output"])[0]
+            file_param = qs.get("path", [""])[0]
+            peer_param = qs.get("peer", [""])[0]
+            if peer_param:
+                # 跨节点:代理到 peer 的 /api/files/has-audio
+                peer = self._peer(peer_param)
+                if not peer:
+                    return json_response(self, 404, {"ok": False, "error": f"peer {peer_param!r} 不存在"})
+                target = f"{peer['url'].rstrip('/')}/api/files/has-audio?dir={dir_param}&path={_urlquote(file_param)}"
+                try:
+                    r = _urlreq.urlopen(_urlreq.Request(target, headers={"User-Agent": "video-manager-proxy/1.0"}), timeout=15)
+                    return json_response(self, 200, {"ok": True, **json.loads(r.read().decode("utf-8", errors="replace"))})
+                except Exception as e:
+                    return json_response(self, 502, {"ok": False, "error": f"peer 不可达: {e}", "has_audio": None})
+            base = config.INPUT_DIR if dir_param == "input" else config.OUTPUT_DIR
+            fp = self._safe_join(base, file_param)
+            if not fp or not fp.is_file():
+                return json_response(self, 404, {"ok": False, "error": "not found", "has_audio": None})
+            has = _probe_has_audio(fp)
+            note = None
+            if has is False:
+                note = "该文件不含音频轨,浏览器原生音量控件将显示灰色不可点"
+            elif has is None:
+                note = "文件无法识别是否含音频"
+            return json_response(self, 200, {"ok": True, "has_audio": has, "note": note})
 
         # ---- 缩略图(ffmpeg 抽帧 + 缓存)----
         if path == "/api/files/thumb":
@@ -810,14 +839,15 @@ class Handler(BaseHTTPRequestHandler):
             cfg, _ = read_script_config()
             return json_response(self, 200, {"config": cfg, "keys": CONFIG_KEYS})
 
-        # ===== 编码参数 (QP / 码率上限 / 强制重压) =====
+        # ===== 编码参数 (QP / 码率上限 / 强制重压 / 音频策略) =====
         if path == "/api/enc-settings":
             return json_response(self, 200, {
-                "qp":               _get_rkmpp_qp(),
-                "bitrate_cap":      _get_rkmpp_bitrate_cap(),
-                "force_recompress": _get_force_recompress(),
-                "keep_audio":       _get_keep_audio(),
-                "audio_bitrate_k":  _get_audio_bitrate_k(),
+                "qp":                    _get_rkmpp_qp(),
+                "bitrate_cap":           _get_rkmpp_bitrate_cap(),
+                "force_recompress":      _get_force_recompress(),
+                "keep_audio":            _get_keep_audio(),
+                "audio_bitrate_k":       _get_audio_bitrate_k(),
+                "recompress_no_audio":   _get_recompress_no_audio(),
             })
 
         if path == "/api/settings":
@@ -1063,6 +1093,10 @@ class Handler(BaseHTTPRequestHandler):
                 br = max(32, min(192, br))
                 _set_setting("audio_bitrate_k", str(br))
                 note.append(f"音频码率={br}kbps")
+            if "recompress_no_audio" in data:
+                v = bool(data.get("recompress_no_audio"))
+                _set_setting("recompress_no_audio", "1" if v else "0")
+                note.append("补压无音轨=ON" if v else "补压无音轨=OFF")
             return json_response(self, 200, {"ok": True, "note": " · ".join(note) or "无变更"})
 
         if path == "/api/service/restart":

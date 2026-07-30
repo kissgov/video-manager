@@ -22,6 +22,7 @@ interface PbFile {
   peerId: string
   peerName: string
   isSelf: boolean
+  hasAudio?: boolean | null // true=有音轨, false=无音轨, null/undefined=尚未探测
 }
 
 const VOL_KEY = 'pb:vol'
@@ -46,6 +47,7 @@ export default function PlaybackPage() {
   const [nextHint, setNextHint] = useState('下一个: —')
   const [curTitle, setCurTitle] = useState('—')
   const [curInfo, setCurInfo] = useState('')
+  const [diagnosis, setDiagnosis] = useState<{ html: string; warn?: boolean; err?: boolean }>({ html: '' })
 
   // 缩略图
   const [thumbsEnabled, setThumbsEnabled] = useState(true)
@@ -92,6 +94,97 @@ export default function PlaybackPage() {
     const v = playerRef.current
     if (v) v.volume = c
   }, [])
+
+  const _fileKey = (f: PbFile) => `${f.peerId}|${f.dir}|${f.path}`
+
+  // video metadata 加载完成:探测音轨数/分辨率,输出诊断 + 回写到文件列表(用于 ⚠️/🎵 标签)
+  const onVideoLoadedMeta = useCallback(() => {
+    const v = playerRef.current
+    const idx = indexRef.current
+    const f = filesRef.current[idx]
+    if (!v || !f) return
+    const w = v.videoWidth || 0
+    const h = v.videoHeight || 0
+    const dur = isFinite(v.duration) ? v.duration : 0
+    // 1) 优先用标准 audioTracks;某些浏览器不暴露则 fallback null,随后会调后端接口判定。
+    let audioN: number | null = null
+    if (typeof (v as any).audioTracks !== 'undefined') {
+      audioN = (v as any).audioTracks.length
+    } else if (typeof (v as any).msAudioTracks !== 'undefined') {
+      audioN = (v as any).msAudioTracks.length
+    }
+
+    const applyDiagnosis = (has: boolean | undefined) => {
+      let html = ''
+      let warn = false, err = false
+      const head: string[] = []
+      if (w && h) head.push(`📼 ${w}×${h}`)
+      if (dur > 0) head.push(`⏱ ${pbFmtDur(dur)}`)
+      if (has === undefined) {
+        warn = true
+        html = `ℹ️ 暂时无法判定是否含音轨。若原生音量按钮为灰色(不可点),就表示该文件没有音轨。`
+      } else if (!has) {
+        err = true
+        html = `⚠️ <b>该文件不含音频轨</b>——所以浏览器原生音量控件显示为灰色、不可点击。${f.dir === 'output' ? '这多半是旧版 -an 压出的历史片,请用 POST /api/enc-settings {"recompress_no_audio":true,"keep_audio":true} 开温和补压,或 force_recompress=true 全量重压即可恢复声音。' : '输入源本身就没有音轨。'}`
+      } else {
+        html = `🎵 含音频轨,浏览器可出声音。若暂时无声:点右上角 🔊/🔇 解除自动播放策略的临时静音,或直接点播放器原生 🔈 按钮调音量。`
+      }
+      html = [...head, html].filter(Boolean).join(' · ')
+      setDiagnosis({ html, warn, err })
+      // 回写 hasAudio 到文件列表
+      if (has !== undefined) {
+        const cur = filesRef.current[idx]
+        if (cur && cur.hasAudio !== has) {
+          const next = filesRef.current.slice()
+          next[idx] = { ...next[idx], hasAudio: has }
+          setFiles(next)
+          filesRef.current = next
+        }
+      }
+    }
+
+    if (audioN !== null) {
+      applyDiagnosis(audioN > 0)
+      return
+    }
+    // 兜底:后端用 ffprobe 直接扫 track types(不 decode,秒回),跨节点也支持
+    applyDiagnosis(undefined)
+    const dir = f.dir || pbDirRef.current || 'output'
+    const q = new URLSearchParams({ dir, path: f.path })
+    if (!f.isSelf && f.peerId) q.set('peer', f.peerId)
+    const probeUrl = f.isSelf
+      ? `/api/files/has-audio?${q.toString()}`
+      : `/api/cluster/has-audio?${q.toString()}`
+    // 如果没实现 cluster/has-audio,退而求其次:本地代理的 /api/files/has-audio 也支持 peer= 参数,所以走它也能
+    const realUrl = f.isSelf ? probeUrl : `/api/files/has-audio?${q.toString()}`
+    api<any>(realUrl, { silent: true }).then((r) => {
+      if (!r || r.ok === false) return
+      if (r.has_audio === true) applyDiagnosis(true)
+      else if (r.has_audio === false) applyDiagnosis(false)
+    }).catch(() => {})
+  }, [])
+
+  // 防过期事件:React 把 video 挂到 DOM 时,它可能已 readyState>=1(metadata 早已加载)
+  // 这时 onLoadedMetadata 不会再触发,导致诊断横幅/无声标签永远不出现。
+  useEffect(() => {
+    let cancelled = false
+    let to: number | null = null
+    const tryFire = () => {
+      if (cancelled) return
+      const v = playerRef.current
+      if (!v) { to = window.setTimeout(tryFire, 50); return }
+      if (v.readyState >= 1) {
+        onVideoLoadedMeta()
+      } else {
+        // 还在加载:等 loadedmetadata 或再延 200ms 最后兜底检查一次
+        const once = () => { v.removeEventListener('loadedmetadata', once); onVideoLoadedMeta() }
+        v.addEventListener('loadedmetadata', once)
+        to = window.setTimeout(() => { v.removeEventListener('loadedmetadata', once); onVideoLoadedMeta() }, 1500)
+      }
+    }
+    tryFire()
+    return () => { cancelled = true; if (to !== null) window.clearTimeout(to) }
+  }, [index, onVideoLoadedMeta])
 
   // ---- 加载事件列表(本机 + 所有 peer)----
   const loadList = useCallback(async () => {
@@ -250,6 +343,7 @@ export default function PlaybackPage() {
     (idx: number) => {
       if (idx < 0 || idx >= filesRef.current.length) return
       setIndex(idx)
+      setDiagnosis({ html: '' }) // 切片:清掉上一段诊断,避免灰按钮信息残留
       const f = filesRef.current[idx]
       const v = playerRef.current
       if (v) {
@@ -572,6 +666,8 @@ export default function PlaybackPage() {
                                 <span style={{ fontFamily: 'monospace', fontSize: 13, fontWeight: isCur ? 600 : 400, color: isCur ? '#1d4ed8' : '#1e293b' }}>{startT}</span>
                                 {f.type === '压缩' ? <Tag color="green" style={{ fontSize: 10, lineHeight: '16px', margin: 0 }}>📦</Tag> : <Tag color="orange" style={{ fontSize: 10, lineHeight: '16px', margin: 0 }}>🎥</Tag>}
                                 {!f.isSelf && <Tag color="blue" style={{ fontSize: 10, lineHeight: '16px', margin: 0 }} title={f.peerId}>🔗 {f.peerName}</Tag>}
+                                {f.hasAudio === false ? <Tag color="red" style={{ fontSize: 10, lineHeight: '16px', margin: 0 }} title="该文件不含音频轨,原生音量按钮会显示灰色">⚠️ 无声</Tag> : null}
+                                {f.hasAudio === true ? <Tag color="geekblue" style={{ fontSize: 10, lineHeight: '16px', margin: 0 }} title="含音频轨">🎵 有声</Tag> : null}
                               </div>
                               <div style={{ fontSize: 11, color: '#64748b' }}>
                                 ⏱ {dur} · {f.size_h || ''}
@@ -628,9 +724,25 @@ export default function PlaybackPage() {
             autoPlay
             playsInline
             preload="metadata"
+            onLoadedMetadata={onVideoLoadedMeta}
             style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#000', display: 'block' }}
           />
         </div>
+        {/* 媒体诊断:告诉用户 原生声音按钮灰色 到底是什么原因 */}
+        {diagnosis.html ? (
+          <div
+            style={{
+              padding: '8px 12px',
+              fontSize: 12,
+              borderTop: '1px solid #334155',
+              background: diagnosis.err ? '#450a0a' : diagnosis.warn ? '#713f12' : '#0c4a6e',
+              color: diagnosis.err ? '#fecaca' : diagnosis.warn ? '#fde68a' : '#e0f2fe',
+              whiteSpace: 'normal',
+              lineHeight: 1.5,
+            }}
+            dangerouslySetInnerHTML={{ __html: diagnosis.html }}
+          />
+        ) : null}
         {/* 缩略图进度条 */}
         <div style={{ padding: 8, borderTop: '1px solid #334155' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>

@@ -4,6 +4,7 @@ ffmpeg 相关:二进制探测、硬件加速检测、命令构造、单文件执
 编码参数(QP/码率上限/强制重压)读取。
 """
 import os
+import re
 import logging
 import subprocess
 from pathlib import Path
@@ -57,6 +58,13 @@ def _get_audio_bitrate_k() -> int:
     """音频码率(kbps),默认 96(人声/监控足够),范围 32-192。"""
     v = _get_setting_int("audio_bitrate_k", 96)
     return max(32, min(192, v))
+
+def _get_recompress_no_audio() -> bool:
+    """当 output 已存在但没有音轨(例如旧版 -an 压出的历史文件)时,
+    若 keep_audio=True 是否自动补重压缩(只重这些,不会全量重压)。
+    默认 False:保持旧行为,避免无提示地占 CPU;用户可 POST /api/enc-settings 打开。
+    """
+    return _get_setting_bool("recompress_no_audio", False)
 
 def _resolve_ffmpeg_bin() -> str:
     for path in [
@@ -153,13 +161,48 @@ def _detect_hwaccel() -> str:
 
     return "soft"
 
+def _probe_has_audio(file: Path) -> bool | None:
+    """快速判断文件是否含音频流(不解码)。返回 True/False,探测失败返回 None。"""
+    try:
+        ffprobe_bin = str(Path(_resolve_ffmpeg_bin()).with_name("ffprobe"))
+        if not Path(ffprobe_bin).is_file():
+            # jellyfin-ffmpeg 常把 ffprobe 放同目录
+            cand = Path(_resolve_ffmpeg_bin()).parent / "ffprobe"
+            if cand.is_file():
+                ffprobe_bin = str(cand)
+            else:
+                # 回退系统路径
+                ffprobe_bin = "ffprobe"
+        r = subprocess.run(
+            [ffprobe_bin, "-v", "error",
+             "-show_entries", "stream=codec_type",
+             "-of", "default=nw=1:nk=1", str(file)],
+            capture_output=True, text=True, timeout=10,
+            env=_ffmpeg_env(),
+        )
+        if r.returncode != 0:
+            return None
+        return any(line.strip() == "audio" for line in (r.stdout or "").splitlines())
+    except Exception as e:
+        log(f"probe audio 失败 {file}: {e}", level=logging.WARNING)
+        return None
+
+
 def _build_ffmpeg_cmd(input_file: Path, output_file: Path, hwaccel: str, ffmpeg_bin: str) -> list:
     base = ["nice", "-n", str(_NICE_LEVEL),
             ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error",
             "-err_detect", "ignore_err", "-fflags", "+discardcorrupt"]
-    # 音频处理：默认保留，转 AAC(浏览器全兼容)，码率可配置。不想占空间可关 keep_audio 走 -an
+    # 音频处理：默认保留，优先转 AAC(浏览器全兼容)。若 ffmpeg 无 aac encoder(精简 jellyfin 变种)，回退 -c:a copy，最后兜底 -an
     if _get_keep_audio():
-        audio_args = ["-c:a", "aac", "-b:a", f"{_get_audio_bitrate_k()}k", "-ac", "1"]  # 监控用单声道即可，再省一半音频空间
+        encs = _probe_encoders(ffmpeg_bin)
+        # 匹配 encoder table 里的 " aac " 行(原生 aac encoder,名称精确为 aac)
+        has_aac_enc = bool(re.search(r"^\s*A\s{2,}aac\s", encs, re.MULTILINE))
+        if has_aac_enc:
+            audio_args = ["-c:a", "aac", "-b:a", f"{_get_audio_bitrate_k()}k", "-ac", "1"]
+        else:
+            # jellyfin-ffmpeg 不自带 aac encoder,走 copy(源若为 aac 浏览器可直接播;其他编码也比丢声强)
+            log(f"{ffmpeg_bin} 未找到 aac encoder,音频策略回退 -c:a copy", level=logging.WARNING)
+            audio_args = ["-c:a", "copy"]
     else:
         audio_args = ["-an"]
     # -movflags +faststart 将 moov atom 移到文件头,浏览器边下边播
