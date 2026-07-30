@@ -195,7 +195,8 @@ export default function ClusterPage() {
   }
 
   function streamUrlFor(peer: PeerFiles, path: string, selfFlag?: boolean) {
-    if (!selfFlag && peer.id && peer.url) {
+    const isSelfNode = Boolean(selfFlag) || (Boolean(self.id) && Boolean(peer.id) && self.id === peer.id)
+    if (!isSelfNode && peer.id && peer.url) {
       // 远端 peer 节点:通过本节点代理
       return apiUrl(`/api/cluster/stream?peer=${encodeURIComponent(peer.id)}&dir=${cfDir}&path=${encodeURIComponent(path)}`)
     }
@@ -203,7 +204,8 @@ export default function ClusterPage() {
     return apiUrl(`/api/files/stream?dir=${cfDir}&path=${encodeURIComponent(path)}`)
   }
   function downloadUrlFor(peer: PeerFiles, path: string, selfFlag?: boolean) {
-    if (!selfFlag && peer.id && peer.url) {
+    const isSelfNode = Boolean(selfFlag) || (Boolean(self.id) && Boolean(peer.id) && self.id === peer.id)
+    if (!isSelfNode && peer.id && peer.url) {
       return apiUrl(`/api/cluster/download?peer=${encodeURIComponent(peer.id)}&dir=${cfDir}&path=${encodeURIComponent(path)}`)
     }
     return apiUrl(`/api/files/download?dir=${cfDir}&path=${encodeURIComponent(path)}`)
@@ -269,7 +271,7 @@ export default function ClusterPage() {
   // 集群文件 peer 卡片
   function PeerFilesCard({ p, isSelf }: { p: PeerFiles; isSelf?: boolean }) {
     const name = p.name || p.id || 'unknown'
-    const selfIsThis = Boolean(isSelf) || (self.id && p.id && self.id === p.id)
+    const selfIsThis: boolean = Boolean(isSelf) || Boolean(self.id && p.id && self.id === p.id)
     if (!p.ok) {
       return (
         <Card size="small" style={{ borderColor: '#fca5a5' }}>
@@ -323,15 +325,15 @@ export default function ClusterPage() {
           <Space size={4}>
             <a
               onClick={() =>
-                setVideoModal({ open: true, url: streamUrlFor(p, r.path), title: r.path, info: name })
+                setVideoModal({ open: true, url: streamUrlFor(p, r.path, selfIsThis), title: r.path, info: name })
               }
             >
               播放
             </a>
-            <a href={downloadUrlFor(p, r.path)} target="_blank" rel="noreferrer">
+            <a href={downloadUrlFor(p, r.path, selfIsThis)} target="_blank" rel="noreferrer">
               下载
             </a>
-            {isSelf ? (
+            {selfIsThis ? (
               <Button type="link" danger size="small" icon={<DeleteOutlined />} onClick={() => deleteFile(r.path)} />
             ) : (
               <Tooltip title="跨节点删除需在节点本机操作">
@@ -348,9 +350,9 @@ export default function ClusterPage() {
         size="small"
         title={
           <Space>
-            <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: isSelf ? '#3b82f6' : '#22c55e' }} />
+            <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: selfIsThis ? '#3b82f6' : '#22c55e' }} />
             <Text strong>{name}</Text>
-            {isSelf && <Tag color="blue">本机</Tag>}
+            {selfIsThis && <Tag color="blue">本机</Tag>}
             <Text type="secondary" style={{ fontSize: 12, fontFamily: 'monospace' }}>{p.url || ''}</Text>
           </Space>
         }
@@ -525,10 +527,10 @@ export default function ClusterPage() {
             </Space>
           </Card>
           <Spin spinning={cfLoading}>
-            {cfData?.self && <div style={{ marginBottom: 12 }}><PeerFilesCard p={cfData.self} /></div>}
+            {cfData?.self && <div style={{ marginBottom: 12 }}><PeerFilesCard p={cfData.self} isSelf={true} /></div>}
             {cfData?.peers?.map((p, i) => (
               <div key={i} style={{ marginBottom: 12 }}>
-                <PeerFilesCard p={p} />
+                <PeerFilesCard p={p} isSelf={false} />
               </div>
             ))}
             {!cfData && <Empty />}
