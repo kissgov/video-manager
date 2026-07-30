@@ -480,6 +480,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         last = since
         deadline = time.time() + 600  # 10 min 上限
+        last_heartbeat = time.time()
         try:
             # 初始心跳
             self.wfile.write(b": connected\n\n")
@@ -495,6 +496,12 @@ class Handler(BaseHTTPRequestHandler):
                 if result:
                     last = result[-1][0]
                     self.wfile.flush()
+                    last_heartbeat = time.time()
+                # 心跳:空闲时每 15s 发一次注释行,防止代理/浏览器因空闲超时断连
+                if time.time() - last_heartbeat >= 15:
+                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+                    last_heartbeat = time.time()
                 time.sleep(1.0)
             # 优雅关闭,让客户端重连
             self.wfile.write(b"event: end\ndata: timeout\n\n")

@@ -24,6 +24,7 @@ export default function LogsPage() {
   const [q, setQ] = useState('')
   const [autoScroll, setAutoScroll] = useState(true)
   const [connected, setConnected] = useState(false)
+  const [everConnected, setEverConnected] = useState(false)
   const sinceRef = useRef(0)
   const listRef = useRef<List>(null)
   const esRef = useRef<EventSource | null>(null)
@@ -32,6 +33,7 @@ export default function LogsPage() {
   const autoScrollRef = useRef(autoScroll)
   autoScrollRef.current = autoScroll
   const reconnectTimer = useRef<any>(null)
+  const reconnectDelay = useRef(600)
 
   // 客户端过滤：级别 + 关键字
   const filtered = useMemo(() => {
@@ -58,7 +60,11 @@ export default function LogsPage() {
       const url = apiUrl(`/api/logs/stream?since=${since}`)
       const es = new EventSource(url)
       esRef.current = es
-      es.onopen = () => setConnected(true)
+      es.onopen = () => {
+        setConnected(true)
+        setEverConnected(true)
+        reconnectDelay.current = 600 // 重置退避
+      }
       es.onmessage = (ev) => {
         try {
           const d = JSON.parse(ev.data)
@@ -103,10 +109,12 @@ export default function LogsPage() {
 
   const scheduleReconnect = useCallback(() => {
     if (reconnectTimer.current) return
+    const delay = reconnectDelay.current
+    reconnectDelay.current = Math.min(delay * 2, 30000) // 指数退避,上限 30s
     reconnectTimer.current = setTimeout(() => {
       reconnectTimer.current = null
       connect(sinceRef.current)
-    }, 600)
+    }, delay)
   }, [connect])
 
   // 兜底轮询（EventSource 不可用时）
@@ -180,7 +188,9 @@ export default function LogsPage() {
       title="实时日志"
       extra={
         <Space wrap>
-          <Tag color={connected ? 'green' : 'red'}>{connected ? '● 已连接' : '○ 重连中'}</Tag>
+          <Tag color={connected ? 'green' : 'orange'}>
+            {connected ? '● 已连接' : everConnected ? '○ 重连中' : '○ 连接中'}
+          </Tag>
           <Input
             size="small"
             allowClear
