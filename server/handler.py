@@ -256,6 +256,109 @@ class Handler(BaseHTTPRequestHandler):
             log(f"proxy stream error: {e}", level=logging.WARNING)
         return None
 
+    def _peer_url(self, peer_id: str):
+        """返回 peer 的 base url(已 rstrip /),不存在/未配置返回 None。"""
+        if not peer_id:
+            return None
+        try:
+            raw = _get_setting("cluster.peers", "[]")
+            peers = json.loads(raw) if raw else []
+        except Exception:
+            peers = []
+        peer = next((p for p in peers if p.get("id") == peer_id), None)
+        if not peer:
+            return None
+        return peer.get("url", "").rstrip("/") or None
+
+    def _proxy_peer_image(self, target_url: str):
+        """通用:从 peer 拉一张图片(jpeg/png)并流式透传。"""
+        req = _urlreq.Request(target_url, headers={"User-Agent": "video-manager-proxy/1.0"})
+        try:
+            upstream = _urlreq.urlopen(req, timeout=15)
+        except Exception as e:
+            return json_response(self, 502, {"ok": False, "error": f"上游 peer 不可达: {e}"})
+        status = upstream.status
+        passthrough = {"Content-Type", "Content-Length", "Cache-Control"}
+        self.send_response(status)
+        for hname, v in upstream.getheaders():
+            if hname in passthrough:
+                self.send_header(hname, v)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        try:
+            while True:
+                chunk = upstream.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            log(f"proxy image error: {e}", level=logging.WARNING)
+        return None
+
+    def _proxy_peer_thumb(self, qs):
+        """代理远端 peer 的单张缩略图。?peer=ID&dir=input|output&path=xxx"""
+        peer_id = qs.get("peer", [""])[0]
+        dir_param = qs.get("dir", ["output"])[0]
+        file_param = qs.get("path", [""])[0]
+        if not file_param:
+            return json_response(self, 400, {"ok": False, "error": "需要 path 参数"})
+        base = self._peer_url(peer_id)
+        if not base:
+            return json_response(self, 404, {"ok": False, "error": f"peer {peer_id!r} 不存在"})
+        target_url = f"{base}/api/files/thumb?dir={dir_param}&path={_urlquote(file_param)}"
+        return self._proxy_peer_image(target_url)
+
+    def _proxy_peer_pb_thumbs(self, qs):
+        """代理远端 peer 的多帧缩略图元数据,重写 url 指向本地代理。
+        ?peer=ID&dir=input|output&path=xxx&count=24
+        上游返回 {duration, thumbs:[{i,t,url,cached}]},url 形如
+        /api/pb/thumb?dir=X&h=Y&i=Z,改写为 /api/cluster/pb/thumb?peer=ID&dir=X&h=Y&i=Z
+        """
+        peer_id = qs.get("peer", [""])[0]
+        dir_param = qs.get("dir", ["output"])[0]
+        file_param = qs.get("path", [""])[0]
+        count = qs.get("count", ["20"])[0]
+        if not file_param:
+            return json_response(self, 400, {"ok": False, "error": "需要 path 参数"})
+        base = self._peer_url(peer_id)
+        if not base:
+            return json_response(self, 404, {"ok": False, "error": f"peer {peer_id!r} 不存在"})
+        target_url = (f"{base}/api/pb/thumbs?dir={dir_param}"
+                      f"&path={_urlquote(file_param)}&count={count}")
+        req = _urlreq.Request(target_url, headers={"User-Agent": "video-manager-proxy/1.0"})
+        try:
+            with _urlreq.urlopen(req, timeout=30) as r:
+                data = json.loads(r.read().decode("utf-8"))
+        except Exception as e:
+            return json_response(self, 502, {"ok": False, "error": f"上游 peer 不可达: {e}"})
+        # 重写每张 thumb 的 url,改走本地 /api/cluster/pb/thumb 代理
+        for th in data.get("thumbs", []) or []:
+            orig = th.get("url", "")
+            h_val = ""
+            i_val = "0"
+            if orig:
+                oq = parse_qs(urlparse(orig).query)
+                h_val = oq.get("h", [""])[0]
+                i_val = oq.get("i", ["0"])[0]
+            th["url"] = (f"/api/cluster/pb/thumb?peer={_urlquote(peer_id)}"
+                         f"&dir={dir_param}&h={h_val}&i={i_val}")
+        return json_response(self, 200, data)
+
+    def _proxy_peer_pb_thumb(self, qs):
+        """代理远端 peer 的单张进度条缩略图。?peer=ID&dir=X&h=Y&i=Z"""
+        peer_id = qs.get("peer", [""])[0]
+        dir_param = qs.get("dir", ["output"])[0]
+        h = qs.get("h", [""])[0]
+        i = qs.get("i", ["0"])[0]
+        base = self._peer_url(peer_id)
+        if not base:
+            return json_response(self, 404, {"ok": False, "error": f"peer {peer_id!r} 不存在"})
+        target_url = f"{base}/api/pb/thumb?dir={dir_param}&h={h}&i={i}"
+        return self._proxy_peer_image(target_url)
+
     def _serve_thumbnail(self, dir_param: str, file_param: str):
         """缩略图接口。返回 jpeg,浏览器可缓存 1 天。"""
         thumb = get_or_make_thumbnail(dir_param, file_param)
@@ -864,6 +967,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/cluster/download":
             return self._proxy_peer_stream(qs, as_attachment=True)
+
+        # ---- 代理:远端 peer 的缩略图(列表缩略图 + 进度条缩略图)----
+        if path == "/api/cluster/thumb":
+            return self._proxy_peer_thumb(qs)
+        if path == "/api/cluster/pb/thumbs":
+            return self._proxy_peer_pb_thumbs(qs)
+        if path == "/api/cluster/pb/thumb":
+            return self._proxy_peer_pb_thumb(qs)
 
         if path == "/api/cron/status":
             # 检查 ofelia 容器状态

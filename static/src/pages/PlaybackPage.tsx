@@ -1,7 +1,7 @@
 // 回放页：监控录像回放（事件列表 + 播放器 + 缩略图进度条 + 自动播放下一段）
 // 1:1 复刻原 app.js 的回放逻辑。跨节点聚合用 /api/cluster/files。
-import { useEffect, useState, useCallback, useRef } from 'react'
-import { Card, DatePicker, Checkbox, Button, Segmented, Space, Spin, Empty, Tag, Typography, App } from 'antd'
+import { useEffect, useState, useCallback, useRef, useMemo } from 'react'
+import { Card, DatePicker, Checkbox, Button, Segmented, Space, Spin, Empty, Tag, Typography, App, Select } from 'antd'
 import dayjs from 'dayjs'
 import { ReloadOutlined } from '@ant-design/icons'
 import { api, apiUrl } from '../api'
@@ -18,6 +18,10 @@ interface PbFile {
   dir: string
   type: string
   streamUrl: string
+  thumbUrl: string
+  peerId: string
+  peerName: string
+  isSelf: boolean
 }
 
 export default function PlaybackPage() {
@@ -29,6 +33,7 @@ export default function PlaybackPage() {
   const [autoplay, setAutoplay] = useState(true)
   const [loop, setLoop] = useState(false)
   const [autoNextDay, setAutoNextDay] = useState(false)
+  const [peerFilter, setPeerFilter] = useState<string>('')
   const [loading, setLoading] = useState(false)
   const [progress, setProgress] = useState('—')
   const [counter, setCounter] = useState('0 / 0')
@@ -60,10 +65,12 @@ export default function PlaybackPage() {
   loopRef.current = loop
   const autoNextDayRef = useRef(autoNextDay)
   autoNextDayRef.current = autoNextDay
+  const peerFilterRef = useRef(peerFilter)
+  peerFilterRef.current = peerFilter
   const thumbsDataRef = useRef(thumbsData)
   thumbsDataRef.current = thumbsData
 
-  // ---- 加载事件列表 ----
+  // ---- 加载事件列表(本机 + 所有 peer)----
   const loadList = useCallback(async () => {
     setLoading(true)
     try {
@@ -71,8 +78,11 @@ export default function PlaybackPage() {
       const out: PbFile[] = []
       for (const d of dirs) {
         const r = await api<any>(`/api/cluster/files?dir=${d}&sort=path&order=asc&page_size=0`, { silent: true })
+        // 本机
         if (r.self && r.self.ok) {
-          for (const f of r.self.files.items || []) {
+          const pid = r.self.id || ''
+          const pname = r.self.name || '本机'
+          for (const f of r.self.files?.items || []) {
             const meta = pbParseName(f.path)
             if (date) {
               const want = date.replace(/-/g, '')
@@ -86,7 +96,38 @@ export default function PlaybackPage() {
               meta,
               dir: d,
               type: d === 'output' ? '压缩' : '原片',
+              peerId: pid,
+              peerName: pname,
+              isSelf: true,
               streamUrl: apiUrl(`/api/files/stream?dir=${d}&path=${encodeURIComponent(f.path)}`),
+              thumbUrl: apiUrl(`/api/files/thumb?dir=${d}&path=${encodeURIComponent(f.path)}`),
+            })
+          }
+        }
+        // 远端 peers
+        for (const peer of r.peers || []) {
+          if (!peer.ok || !peer.files) continue
+          const pid = peer.id || ''
+          const pname = peer.name || pid
+          for (const f of peer.files.items || []) {
+            const meta = pbParseName(f.path)
+            if (date) {
+              const want = date.replace(/-/g, '')
+              if (!meta || meta.date !== want) continue
+            }
+            out.push({
+              path: f.path,
+              size: f.size,
+              size_h: f.size_h,
+              mtime: f.mtime,
+              meta,
+              dir: d,
+              type: d === 'output' ? '压缩' : '原片',
+              peerId: pid,
+              peerName: pname,
+              isSelf: false,
+              streamUrl: apiUrl(`/api/cluster/stream?peer=${encodeURIComponent(pid)}&dir=${d}&path=${encodeURIComponent(f.path)}`),
+              thumbUrl: apiUrl(`/api/cluster/thumb?peer=${encodeURIComponent(pid)}&dir=${d}&path=${encodeURIComponent(f.path)}`),
             })
           }
         }
@@ -111,17 +152,37 @@ export default function PlaybackPage() {
     loadList()
   }, [loadList])
 
-  // ---- 统计 ----
-  const totalDur = files.reduce((s, f) => s + (f.meta ? f.meta.dur : 0), 0)
-  const totalSize = files.reduce((s, f) => s + (f.size || 0), 0)
+  // ---- 节点筛选 ----
+  // 从已加载文件里枚举出有文件的节点(本机 + peers)
+  const nodeOptions = useMemo(() => {
+    const opts: { label: string; value: string }[] = [{ label: '🌐 全部节点', value: '' }]
+    const seen = new Set<string>()
+    for (const f of files) {
+      if (seen.has(f.peerId)) continue
+      seen.add(f.peerId)
+      opts.push({ label: (f.isSelf ? '📍 ' : '🔗 ') + f.peerName, value: f.peerId })
+    }
+    return opts
+  }, [files])
 
-  // 按小时分组
+  const visibleFiles = useMemo(
+    () => (peerFilter ? files.filter((f) => f.peerId === peerFilter) : files),
+    [files, peerFilter],
+  )
+
+  // ---- 统计 ----
+  const totalDur = visibleFiles.reduce((s, f) => s + (f.meta ? f.meta.dur : 0), 0)
+  const totalSize = visibleFiles.reduce((s, f) => s + (f.size || 0), 0)
+
+  // 按小时分组(保留原始索引 _idx 用于播放定位)
   const groups: Record<string, PbFile[]> = {}
   files.forEach((f, i) => {
+    if (peerFilter && f.peerId !== peerFilter) return
     const dt = f.meta ? f.meta.start.substring(0, 13) : f.mtime.substring(0, 13)
     if (!groups[dt]) groups[dt] = []
-    groups[dt].push({ ...f, path: f.path } as any)
-    ;(groups[dt][groups[dt].length - 1] as any)._idx = i
+    const entry = { ...f }
+    ;(entry as any)._idx = i
+    groups[dt].push(entry)
   })
 
   // ---- 加载缩略图 ----
@@ -131,16 +192,21 @@ export default function PlaybackPage() {
       setThumbsStatus('')
       return
     }
-    if (thumbsFileRef.current === file.path && thumbsDataRef.current) return
+    const fileKey = `${file.peerId}|${file.dir}|${file.path}`
+    if (thumbsFileRef.current === fileKey && thumbsDataRef.current) return
     thumbsReqRef.current++
     const myReq = thumbsReqRef.current
-    thumbsFileRef.current = file.path
+    thumbsFileRef.current = fileKey
     setThumbsData(null)
     setThumbsLoading(true)
     setThumbsStatus('正在提取缩略图...')
     const dir = file.dir || pbDirRef.current || 'output'
+    // peer 文件走本地代理转发,避免直连 peer 造成 Mixed Content / CORS
+    const thumbsUrl = file.isSelf
+      ? `/api/pb/thumbs?dir=${encodeURIComponent(dir)}&path=${encodeURIComponent(file.path)}&count=24`
+      : `/api/cluster/pb/thumbs?peer=${encodeURIComponent(file.peerId)}&dir=${encodeURIComponent(dir)}&path=${encodeURIComponent(file.path)}&count=24`
     try {
-      const r = await api<any>(`/api/pb/thumbs?dir=${encodeURIComponent(dir)}&path=${encodeURIComponent(file.path)}&count=24`, { silent: true })
+      const r = await api<any>(thumbsUrl, { silent: true })
       if (myReq !== thumbsReqRef.current) return
       if (r.error) {
         setThumbsStatus('缩略图提取失败: ' + r.error)
@@ -173,12 +239,14 @@ export default function PlaybackPage() {
       const startT = f.meta ? f.meta.start : f.mtime
       const endT = f.meta ? f.meta.end : ''
       setCurTitle(f.path)
-      setCurInfo(`${startT}${endT ? ' → ' + endT : ''} · ${f.size_h || ''}`)
+      const peerTag = f.isSelf ? '' : ` · 🔗 ${f.peerName}`
+      setCurInfo(`${startT}${endT ? ' → ' + endT : ''} · ${f.size_h || ''}${peerTag}`)
       setCounter(`${idx + 1} / ${filesRef.current.length}`)
       const next = filesRef.current[idx + 1]
       if (next) {
         const ns = next.meta ? next.meta.start.substring(11, 19) : '—'
-        setNextHint(`下一个 (→): ${ns} · ${next.path}`)
+        const np = next.isSelf ? '' : ` · 🔗 ${next.peerName}`
+        setNextHint(`下一个 (→): ${ns} · ${next.path}${np}`)
       } else {
         setNextHint(loopRef.current ? '下一个 (→): 循环到第一个' : '已是最后一段')
       }
@@ -186,30 +254,51 @@ export default function PlaybackPage() {
     [loadThumbs]
   )
 
+  // 判断文件是否通过当前节点筛选(无筛选时全部通过)
+  const passesFilter = useCallback((f: PbFile) => {
+    const pf = peerFilterRef.current
+    return !pf || f.peerId === pf
+  }, [])
+
   const next = useCallback(() => {
+    const files = filesRef.current
     const idx = indexRef.current
     if (idx < 0) {
-      if (filesRef.current.length) play(0)
+      const first = files.findIndex(passesFilter)
+      if (first >= 0) play(first)
       return
     }
-    if (idx + 1 < filesRef.current.length) {
-      play(idx + 1)
-      return
+    for (let i = idx + 1; i < files.length; i++) {
+      if (passesFilter(files[i])) { play(i); return }
     }
     if (autoNextDayRef.current && dateRef.current) {
       goNextDay()
       return
     }
-    if (loopRef.current) play(0)
-    else message.info('已是最后一段')
+    if (loopRef.current) {
+      const first = files.findIndex(passesFilter)
+      if (first >= 0) play(first)
+      return
+    }
+    message.info('已是最后一段')
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [play, message])
+  }, [play, message, passesFilter])
 
   const prev = useCallback(() => {
+    const files = filesRef.current
     const idx = indexRef.current
-    if (idx > 0) play(idx - 1)
-    else message.info('已是第一段')
-  }, [play, message])
+    if (idx < 0) {
+      for (let i = files.length - 1; i >= 0; i--) {
+        if (passesFilter(files[i])) { play(i); return }
+      }
+      message.info('已是第一段')
+      return
+    }
+    for (let i = idx - 1; i >= 0; i--) {
+      if (passesFilter(files[i])) { play(i); return }
+    }
+    message.info('已是第一段')
+  }, [play, passesFilter, message])
 
   async function goNextDay() {
     try {
@@ -367,6 +456,14 @@ export default function PlaybackPage() {
                 allowClear
               />
             </Space.Compact>
+            <Select
+              size="small"
+              value={peerFilter}
+              onChange={(v) => setPeerFilter(v)}
+              options={nodeOptions}
+              style={{ width: '100%' }}
+              placeholder="选择节点"
+            />
             <Checkbox checked={autoplay} onChange={(e) => setAutoplay(e.target.checked)}>
               自动播放下一段
             </Checkbox>
@@ -382,12 +479,12 @@ export default function PlaybackPage() {
           </Space>
         </Card>
         <div style={{ fontSize: 12, color: '#64748b', padding: '8px 12px', borderBottom: '1px solid #f0f0f0' }}>
-          📊 <b>{files.length}</b> 个事件 · ⏱ 总时长 <b>{pbFmtDur(totalDur)}</b> · 💾 <b>{humanSize(totalSize)}</b>
+          📊 <b>{visibleFiles.length}</b> 个事件 · ⏱ 总时长 <b>{pbFmtDur(totalDur)}</b> · 💾 <b>{humanSize(totalSize)}</b>
           {date ? <div>📅 {date}</div> : <div>📅 全部日期</div>}
         </div>
         <Spin spinning={loading}>
           <div style={{ overflowY: 'auto', maxHeight: listHeight }} className="dark-scroll">
-            {files.length === 0 ? (
+            {visibleFiles.length === 0 ? (
               <div style={{ textAlign: 'center', padding: 24, color: '#94a3b8', fontSize: 13 }}>
                 没有事件
                 <br />
@@ -420,7 +517,7 @@ export default function PlaybackPage() {
                         >
                           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                             <img
-                              src={apiUrl(`/api/files/thumb?dir=${f.dir}&path=${encodeURIComponent(f.path)}`)}
+                              src={f.thumbUrl}
                               loading="lazy"
                               style={{ width: 80, height: 48, objectFit: 'cover', borderRadius: 4, background: '#e2e8f0', flexShrink: 0 }}
                               onError={(e) => ((e.target as HTMLImageElement).style.visibility = 'hidden')}
@@ -431,6 +528,7 @@ export default function PlaybackPage() {
                                 <span>{isCur ? '▶' : '🎬'}</span>
                                 <span style={{ fontFamily: 'monospace', fontSize: 13, fontWeight: isCur ? 600 : 400, color: isCur ? '#1d4ed8' : '#1e293b' }}>{startT}</span>
                                 {f.type === '压缩' ? <Tag color="green" style={{ fontSize: 10, lineHeight: '16px', margin: 0 }}>📦</Tag> : <Tag color="orange" style={{ fontSize: 10, lineHeight: '16px', margin: 0 }}>🎥</Tag>}
+                                {!f.isSelf && <Tag color="blue" style={{ fontSize: 10, lineHeight: '16px', margin: 0 }} title={f.peerId}>🔗 {f.peerName}</Tag>}
                               </div>
                               <div style={{ fontSize: 11, color: '#64748b' }}>
                                 ⏱ {dur} · {f.size_h || ''}
