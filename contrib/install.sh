@@ -155,6 +155,11 @@ ensure_sudoers
 # ---------- 安装路径 ----------
 if [[ "$UPDATE" == true ]]; then
   log "🔄 升级模式"
+  # 自动识别安装位置: 默认 INSTALL_DIR 不存在,但当前目录是源码仓库 → in-place 升级
+  if [[ ! -d "$INSTALL_DIR" && -f "./app.py" && -d "./.git" ]]; then
+    INSTALL_DIR="$(pwd)"
+    warn "默认路径 /opt/video-manager 不存在,检测到当前目录是源码 → in-place 升级 ($INSTALL_DIR)"
+  fi
   [[ -d "$INSTALL_DIR" ]] || { err "找不到 $INSTALL_DIR,先 --primary 或 --worker 安装一次"; exit 1; }
   cd "$INSTALL_DIR"
   if [[ -d .git ]]; then
