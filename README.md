@@ -1,6 +1,6 @@
 # Video Manager
 
-> 单文件 Python 写的视频压缩任务管理 Web UI，自带 SQLite 历史，Python 标准库零依赖。  
+> Python 写的视频压缩任务管理 Web UI，模块化 `server/` 包 + React SPA 前端，自带 SQLite 历史，Python 标准库零依赖。
 > 支持多机集群部署（一个 NAS 一个节点，统一 web UI 聚合）。
 
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
@@ -76,16 +76,18 @@ sudo bash contrib/install-sudoers.sh   # 一次,以后免密
 
 - 实时看 worker 状态、当前处理文件、速度
 - 队列管理（pending / running / done / failed / skipped）
-- 实时日志跟踪
+- 实时日志跟踪（SSE 推送 + 虚拟滚动）
 - 文件浏览器（输入/输出）
-- 在线改压缩脚本参数（带备份）
-- 管理 cron 定时任务 + 一键重启
+- 在线改编码参数（QP/码率/CRF，热加载）+ 路径配置
+- 管理 cron 定时任务（内置调度器 + ofelia 兼容）
 - 多机集群：每个节点一份 web UI，集群 tab 聚合其他节点状态
 - 回放页：缩略图进度条、跨节点文件聚合、视频流代理（解决 HTTPS Mixed Content）
 
 ## 特性
 
-- **零 pip 依赖** — `app.py` 用 `http.server` + `sqlite3`，任何 Python 3.8+ 都能跑
+- **零 pip 依赖** — `server/` 包用 `http.server` + `sqlite3`，任何 Python 3.8+ 都能跑
+- **React SPA 前端** — Ant Design 5 + TypeScript + Vite，预构建产物在 `static/dist/`，部署不需要 Node.js
+- **Python worker** — 压缩在进程内线程执行，无需 `compress_video.sh` / Docker / ofelia
 - **单服务（一个 systemd unit）** — 不依赖 Caddy / Nginx / Docker
 - **跨平台** — RK3588 (aarch64) 自动装 RKMPP 硬编，x86 软编 fallback
 - **单 SQLite** — 历史/队列/任务都在 `data/history.db`
@@ -101,17 +103,23 @@ sudo bash contrib/install-sudoers.sh   # 一次,以后免密
 │  Browser → http://<NAS-IP>:8765         (LAN / Tailscale)      │
 │                                                                │
 │  ┌──────────────────────────────────────────┐                  │
-│  │  python3 app.py (ThreadingHTTPServer)    │  ONE service      │
-│  │  ├─ /api/queue      任务列表/CRUD         │                  │
-│  │  ├─ /api/run|stop   worker 控制           │                  │
-│  │  ├─ /api/files      本机文件浏览          │                  │
-│  │  ├─ /api/cluster/*  多机集群 (peer CRUD,  │                  │
-│  │  │                 状态聚合,文件代理)     │                  │
-│  │  └─ /static/*       SPA 前端              │                  │
+│  │  python3 app.py → server.app.main()      │  ONE service      │
+│  │  (ThreadingHTTPServer)                   │                  │
+│  │                                          │                  │
+│  │  server/ 包:                             │                  │
+│  │  ├─ handler.py     HTTP 路由 + API       │                  │
+│  │  ├─ worker.py      Python 压缩 worker    │                  │
+│  │  ├─ scheduler.py   内置 cron 调度线程    │                  │
+│  │  ├─ cluster.py     集群 peer 轮询/聚合   │                  │
+│  │  ├─ ffmpeg.py      ffmpeg 探测+命令构建  │                  │
+│  │  ├─ db.py          SQLite (WAL)          │                  │
+│  │  └─ config.py      配置/日志/工具        │                  │
+│  │                                          │                  │
+│  │  /static/dist/    React SPA (预构建)     │                  │
 │  └──────────────────────────────────────────┘                  │
 │      │                                                         │
-│      ├─→ SQLite (data/history.db)                              │
-│      ├─→ /input → /output                                      │
+│      ├─→ SQLite (data/history.db, WAL mode)                    │
+│      ├─→ /input → /output (UI 配置热加载)                      │
 │      ├─→ ffmpeg (rkmpp 优先, libx264 兜底)                      │
 │      └─→ 其他 peer NAS (HTTP, 5s/30s 轮询)                     │
 │                                                                │
@@ -137,7 +145,7 @@ sudo bash contrib/install-sudoers.sh   # 一次,以后免密
 | 数据库 | `data/history.db`（gitignored） |
 | 日志 | `logs/stdout.log` `logs/stderr.log` |
 | 集群 peers | `data/peers.json` 或 `settings:cluster.peers`（DB） |
-| 输入/输出 | 在 UI 配置 tab 改，或编辑 `app.py` 顶部 `INPUT_DIR`/`OUTPUT_DIR` |
+| 输入/输出 | 在 UI 配置 tab 改（热加载），或设环境变量 `VIDEO_MANAGER_INPUT_DIR`/`VIDEO_MANAGER_OUTPUT_DIR` |
 
 ---
 
