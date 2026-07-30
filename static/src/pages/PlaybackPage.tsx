@@ -563,14 +563,14 @@ export default function PlaybackPage() {
             <Button size="small" onClick={fullscreen}>⛶ 全屏</Button>
           </Space>
         </div>
-        <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#000', minHeight: 300, position: 'relative' }}>
+        <div style={{ flex: 1, width: '100%', height: '100%', background: '#000', minHeight: 300, position: 'relative', overflow: 'hidden' }}>
           <video
             ref={playerRef}
             controls
             autoPlay
             playsInline
             preload="metadata"
-            style={{ maxWidth: '100%', maxHeight: 'calc(100vh - 350px)', background: '#000', display: 'block' }}
+            style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#000', display: 'block' }}
           />
         </div>
         {/* 缩略图进度条 */}
