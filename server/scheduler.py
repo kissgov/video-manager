@@ -122,10 +122,34 @@ def _next_run_time(expr: str, after: datetime) -> datetime:
         return cur
     raise ValueError(f"找不到下次运行时间: {expr!r}")
 
+def _check_daily_cleanup():
+    """每日清理检查:跨天且 retention_days>0 时触发 output 目录清理。"""
+    from .db import _get_setting, _set_setting
+    from .cleanup import cleanup_output
+    today = datetime.now().strftime("%Y-%m-%d")
+    last_run = _get_setting("cleanup.last_run_date", "")
+    if last_run == today:
+        return
+    retention_days = 365
+    try:
+        retention_days = int(_get_setting("cleanup.output_retention_days", "365"))
+    except (ValueError, TypeError):
+        retention_days = 365
+    if retention_days <= 0:
+        _set_setting("cleanup.last_run_date", today)
+        return
+    try:
+        cleanup_output(retention_days)
+    except Exception as e:
+        log(f"cleanup error: {e}", level=logging.WARNING)
+    _set_setting("cleanup.last_run_date", today)
+
+
 def _scheduler_tick():
     # 延迟导入,避免 scheduler <-> worker 循环(worker 不依赖 scheduler,但保持对称)
     from .worker import start_run
     now = datetime.now().replace(second=0, microsecond=0)
+    _check_daily_cleanup()
     with db() as conn, _db_lock:
         schedules = [dict(r) for r in conn.execute(
             "SELECT * FROM schedules WHERE enabled=1"

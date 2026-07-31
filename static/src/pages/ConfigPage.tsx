@@ -195,6 +195,69 @@ function EncForm() {
   )
 }
 
+// ---- 自动清理配置 ----
+function CleanupForm() {
+  const { message } = App.useApp()
+  const [days, setDays] = useState(365)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const r = await api<any>('/api/cleanup-settings', { silent: true })
+      setDays(r.output_retention_days ?? 365)
+    } catch {
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    load()
+  }, [load])
+
+  async function save() {
+    setSaving(true)
+    try {
+      const r = await api<any>('/api/cleanup-settings', {
+        method: 'POST',
+        body: { output_retention_days: days },
+      })
+      if (r.ok) message.success('清理设置已保存 · ' + r.note)
+    } catch {
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Card title="自动清理" extra={<Button size="small" icon={<ReloadOutlined />} onClick={load} />}>
+      <Spin spinning={loading}>
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          仅清理 output 压缩目录中超过保留期的文件,input 原片不受影响。按文件名时间戳判断。
+          设为 0 关闭自动清理,每天由 scheduler 自动执行一次。
+        </Text>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 16 }}>
+          <span>output 保留天数</span>
+          <InputNumber
+            min={0}
+            max={3650}
+            value={days}
+            onChange={(v) => setDays(v ?? 365)}
+            style={{ width: 120 }}
+            addonAfter="天"
+          />
+          <Button type="primary" onClick={save} loading={saving}>保存</Button>
+        </div>
+        <div style={{ fontSize: 12, color: '#64748b', marginTop: 8 }}>
+          默认 365 天(1年)。0 = 不清理。
+        </div>
+      </Spin>
+    </Card>
+  )
+}
+
 // ---- 脚本参数 ----
 function ConfigForm() {
   const { message } = App.useApp()
@@ -358,6 +421,7 @@ export default function ConfigPage() {
       </Card>
       <SettingsForm />
       <EncForm />
+      <CleanupForm />
       <ConfigForm />
     </Space>
   )

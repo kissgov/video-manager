@@ -850,6 +850,17 @@ class Handler(BaseHTTPRequestHandler):
                 "recompress_no_audio":   _get_recompress_no_audio(),
             })
 
+        if path == "/api/cleanup-settings":
+            from .db import _get_setting
+            raw = _get_setting("cleanup.output_retention_days", "365")
+            try:
+                retention_days = int(raw)
+            except (ValueError, TypeError):
+                retention_days = 365
+            return json_response(self, 200, {
+                "output_retention_days": retention_days,
+            })
+
         if path == "/api/settings":
             return json_response(self, 200, {
                 "input_dir":  str(config.INPUT_DIR),
@@ -1098,6 +1109,16 @@ class Handler(BaseHTTPRequestHandler):
                 _set_setting("recompress_no_audio", "1" if v else "0")
                 note.append("补压无音轨=ON" if v else "补压无音轨=OFF")
             return json_response(self, 200, {"ok": True, "note": " · ".join(note) or "无变更"})
+
+        if path == "/api/cleanup-settings":
+            days = int(data.get("output_retention_days", 365))
+            days = max(0, days)
+            _set_setting("cleanup.output_retention_days", str(days))
+            return json_response(self, 200, {
+                "ok": True,
+                "output_retention_days": days,
+                "note": f"保留 {days} 天" if days > 0 else "已关闭自动清理",
+            })
 
         if path == "/api/service/restart":
             # 重启当前 video-manager 服务本身。
